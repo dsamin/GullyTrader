@@ -15,6 +15,7 @@ import logging
 import threading
 import time
 
+from agents.scanner import shortlist as scanner_shortlist
 from cricket_data import get_feed
 from exit_monitor import PositionSnapshot, evaluate
 from kalshi_client import KalshiClient
@@ -50,8 +51,23 @@ def run_entry_pipeline_once(*, force: bool = False) -> dict:
 
         client = KalshiClient()
         markets = client.list_ipl_markets()
-        # TODO: scanner / researcher / decision agents
-        return {"status": "ok", "markets_scanned": len(markets), "live": bool(live)}
+
+        candidates = scanner_shortlist(markets, max_results=5)
+        log.info(
+            "orchestrator.entry: %d markets → %d scanner candidates%s",
+            len(markets), len(candidates),
+            (" [" + ", ".join(f"{c.ticker} ({c.score})" for c in candidates) + "]") if candidates else "",
+        )
+        # TODO: researcher / decision agents (next phase)
+        return {
+            "status": "ok",
+            "markets_scanned": len(markets),
+            "candidates": [
+                {"ticker": c.ticker, "score": c.score, "reason": c.reason}
+                for c in candidates
+            ],
+            "live": bool(live),
+        }
     finally:
         _entry_lock.release()
 
