@@ -34,6 +34,10 @@ import sync_service
 from cricket_data import get_feed
 from kalshi_client import KalshiClient
 from pnl import normalize_position_side, position_contract_count
+from reconciler import (
+    kalshi_event_for_fixture,
+    kalshi_event_for_live_match,
+)
 from settings import settings
 
 
@@ -135,10 +139,22 @@ async def list_positions() -> dict:
 
 @app.get("/api/match/live")
 async def get_live_match() -> dict:
+    """Live cricket state plus the matching Kalshi event_ticker if found.
+
+    The frontend uses `kalshi_event_ticker` to deep-link from the dashboard's
+    "Live now" strip into match centre / bet sheet without re-resolving.
+    """
     feed = get_feed()
     live = feed.live_match()
     if not live:
         return {"live": None}
+
+    kalshi_ev = None
+    try:
+        kalshi_ev = kalshi_event_for_live_match(live, KalshiClient().list_ipl_events())
+    except Exception:
+        log.exception("api.live: kalshi reconciliation failed (non-fatal)")
+
     return {
         "live": {
             "match_id": live.match_id,
@@ -152,6 +168,7 @@ async def get_live_match() -> dict:
             "last_balls": live.last_balls,
             "win_probability_a": live.win_probability_a,
             "status_text": live.status_text,
+            "kalshi_event_ticker": kalshi_ev.event_ticker if kalshi_ev else None,
         }
     }
 
@@ -202,20 +219,29 @@ async def list_ipl_events() -> dict:
 
 @app.get("/api/fixtures")
 async def get_fixtures() -> dict:
+    """Upcoming fixtures with the matching Kalshi event_ticker attached when known."""
     feed = get_feed()
-    return {
-        "fixtures": [
-            {
-                "match_id": f.match_id,
-                "team_a": f.team_a, "team_b": f.team_b,
-                "venue": f.venue, "start_time": f.start_time_iso,
-                "head_to_head": f.head_to_head, "weather": f.weather,
-                "expected_yes_a": f.expected_yes_a,
-                "is_hot": f.is_hot,
-            }
-            for f in feed.upcoming_fixtures()
-        ]
-    }
+    fixtures = feed.upcoming_fixtures()
+
+    kalshi_events = []
+    try:
+        kalshi_events = KalshiClient().list_ipl_events()
+    except Exception:
+        log.exception("api.fixtures: kalshi reconciliation failed (non-fatal)")
+
+    out = []
+    for f in fixtures:
+        ev = kalshi_event_for_fixture(f, kalshi_events) if kalshi_events else None
+        out.append({
+            "match_id": f.match_id,
+            "team_a": f.team_a, "team_b": f.team_b,
+            "venue": f.venue, "start_time": f.start_time_iso,
+            "head_to_head": f.head_to_head, "weather": f.weather,
+            "expected_yes_a": f.expected_yes_a,
+            "is_hot": f.is_hot,
+            "kalshi_event_ticker": ev.event_ticker if ev else None,
+        })
+    return {"fixtures": out}
 
 
 @app.get("/api/standings")
