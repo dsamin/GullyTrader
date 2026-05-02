@@ -19,61 +19,24 @@ Verified working end-to-end against live services:
 - **Scanner agent:** prompts qwen-2.5-72b via OpenRouter, returns ranked candidates with grounded reasoning ("SRH have a strong recent form, undervalued at 50¢"). ~16s round-trip. Persists to `agent_logs`.
 - **Frontend:** all 8 screens render against live data. Hash-router navigation. Light + dark mode.
 - **Strict external-service auth gating (Phase 1.5, 2026-05-01):** missing Kalshi creds or CricAPI key default to a loud startup failure when `KALSHI_API_ENV=prod`. `place_limit_order` always raises in prod-unauthed regardless of strict flag. One-line startup banner logs resolved auth state. Override via `GULLYTRADER_STRICT_EXTERNAL_SERVICES`.
-- **Tests:** **102 passing** (P&L correction, cricket feed, scanner, reconciler, kalshi client orders/fills/settlements, sync service reconciliation, portfolio metrics, API integration).
+- **Researcher agent (Phase 3, 2026-05-01):** wired. LLM (`settings.research_model`, default `deepseek/deepseek-chat-v3-0324`) returns `ResearchNote{estimated_yes_probability, confidence, reasoning}`. Probability clamped to `[0,1]`. Falls back to `confidence=0` (which makes Decision skip) when LLM unavailable.
+- **Decision agent (Phase 3, 2026-05-01):** wired. Pure-math Quarter-Kelly sizer; no LLM call. Skips on `edge<5¢`, `confidence=0`, contracts<1, or zero bankroll. Limit price = best-bid + 1¢, clamped `[1, 99]` (TODO: expose `yes_ask`/`no_ask` for marketable orders).
+- **PortfolioExit agent (Phase 3, 2026-05-01):** wired. LLM (`settings.exit_model`, default qwen) returns `hold`/`sell`. Defaults to HOLD on any failure mode (LLM unavailable, malformed JSON, invalid action) — never accidentally sells on a bad LLM response.
+- **Orchestrator entry pipeline (Phase 3, 2026-05-01):** end-to-end. `run_entry_pipeline_once` runs Scanner → Researcher → Decision per candidate; `place_limit_order` only fires when `GULLYTRADER_DECISION_MODE=live` (default `shadow`). Response shape includes per-candidate `research`, `decision`, and `order` blocks plus top-level `decision_mode`.
+- **Orchestrator exit pipeline (Phase 3, 2026-05-01):** real mark prices via `client.get_market(ticker)` per position; LLM path delegates to PortfolioExit; live sells (at `mark - 1¢`) only when `GULLYTRADER_EXIT_MODE=live`.
+- **Tests:** **129 passing** (Phase 3 added 27 across researcher / decision / portfolio_exit / orchestrator wiring).
 
 ## Next-up — ranked
 
-### 1. Researcher agent (next code task)
+### 1. Phase 4 carry-overs from Phase 3 wiring
 
-**Why:** the scanner returns ticker + score + 1-line reason. The researcher takes those candidates and produces an estimated YES probability + confidence + paragraph-level reasoning grounded in live ball-by-ball context. This is what the decision agent will consume.
+These are real bugs surfaced by the Phase 3 wiring that we deferred to keep the PR focused. They should be the first follow-up:
 
-**Estimated effort:** ~1.5 hours.
+- **`peak_pnl_cents=0` placeholder in orchestrator exit pipeline** ([`orchestrator.py`](../gully-engine/orchestrator.py) `run_exit_monitor_once`). Trailing stop never fires because peak P&L is never tracked. Needs per-position peak-P&L state — likely a new in-memory dict keyed by ticker (refresh the peak each pass; reset when position closes), or a dedicated DB column on `positions`.
+- **`opened_at=now-600` placeholder** (same function). Time-stop fires based on wall clock minus 10 minutes, not the real position-open time. Needs the open timestamp tracked from the first fill on each ticker (already in the `fills` table — derive on read via `MIN(created_time) WHERE ticker=...`).
+- **`KalshiMarket` exposes only `yes_price`/`no_price` (bid side).** Decision posts at `bid + 1¢` which sits at top of queue but won't fill unless someone crosses. For marketable orders, expose `yes_ask`/`no_ask` from `_market_from_dict` (the API field is `yes_ask` / `no_ask`) and update Decision to use them.
 
-**Implementation pattern:** copy [`agents/scanner.py`](../gully-engine/agents/scanner.py).
-
-**Concrete steps:**
-1. Replace [`agents/researcher.py`](../gully-engine/agents/researcher.py) — currently returns implied probability unchanged.
-2. New `ResearchNote` dataclass already exists. Add `confidence` and a richer `reasoning` field if not already there.
-3. System prompt: "You are a quantitative cricket analyst. Given live match state and a YES/NO market, estimate true probability of YES. Return JSON `{estimated_probability: 0-1, confidence: 0-1, reasoning: <paragraph>}`."
-4. User prompt: market title + current price + live state from `cricket_data.get_feed().live_match()` + relevant context (overs, RRR, batters, last balls).
-5. Call `llm.chat_json(agent="researcher", model=settings.research_model, ...)`.
-6. Add `tests/test_researcher.py` mirroring `test_scanner.py`'s mock pattern.
-7. Wire into orchestrator: after `scanner_shortlist`, loop candidates through `researcher.research()`.
-
-**Acceptance:** `POST /api/orchestrator/run-entry` returns scanner candidates + researcher notes. `agent_logs` shows both `scanner` and `researcher` rows per pass.
-
-### 2. Decision agent
-
-**Why:** the researcher gives us an estimated probability. Decision converts that into a sized order: action (buy YES / buy NO / pass), contracts, limit price.
-
-**Estimated effort:** ~1.5 hours.
-
-**Concrete steps:**
-1. Replace [`agents/decision.py`](../gully-engine/agents/decision.py) — currently always returns "pass".
-2. Inputs: `ResearchNote` + bankroll (from Kalshi balance) + market price.
-3. Compute edge: `estimated_probability - implied_probability`.
-4. Skip if edge < 5¢ (threshold defined as `MIN_EDGE` in the existing stub).
-5. Size with quarter-Kelly: `fraction = (edge / (1 - implied_probability)) * 0.25`, clamped by `MAX_POSITION_PCT = 0.05`.
-6. Convert to contract count + limit price (`limit_price = best_bid + 1¢` or similar).
-7. Tests with mocked researcher inputs covering: pass-on-low-edge, buy-YES path, buy-NO path, max-position clamp, zero-bankroll edge case.
-
-**Acceptance:** orchestrator's entry pipeline, end-to-end, returns decisions. With orchestrator threads enabled (`GULLYTRADER_ENABLE_ORCHESTRATOR=1`) and a real authed account, "buy" decisions actually place limit orders via `KalshiClient.place_limit_order()`.
-
-**Risk control:** keep `EXIT_MODE=shadow` in `.env` while testing. The decision agent doesn't have a shadow mode itself — once a buy order is placed, it's real money. Hold this agent in code review longer than the others.
-
-### 3. Portfolio-exit agent (LLM-driven exits)
-
-**Why:** the deterministic hard stops in `exit_monitor.py` already work (stop loss, trailing, time). The portfolio_exit agent handles the nuanced cases: take profit early on momentum reversals, ride a winner through a tightening spread, etc.
-
-**Estimated effort:** ~1.5 hours.
-
-**Concrete steps:** same shape as scanner / researcher. Inputs: `PositionSnapshot` + live match state + recent price action. Output: `ExitDecision{action: hold|sell, mode: shadow|live, reasoning: ...}`. Already partially shaped at [`agents/portfolio_exit.py`](../gully-engine/agents/portfolio_exit.py).
-
-**Acceptance:** `POST /api/orchestrator/run-exit` returns LLM-driven exit decisions for any position that no hard stop applied to.
-
-**Critical:** must run in shadow mode for at least one full IPL match before flipping to live. The first session is read-only validation.
-
-### 4. Operational follow-ups
+### 2. Operational follow-ups
 
 These don't block the agents but make the engine production-ready:
 
@@ -83,14 +46,14 @@ These don't block the agents but make the engine production-ready:
 - [ ] Backfill test coverage toward 170+ (KalshiTrader's bench). Priority adds: orchestrator manual-trigger lock semantics, sync_service keep-alive, exit_monitor hard-stop matrix, kalshi_client RSA signing format
 - [ ] Add Playwright visual regression for the 8 screens
 
-### 5. UX polish
+### 3. UX polish
 
 - [ ] Confetti animation when a winning settlement lands (CSS already in `styles.css`, just needs trigger)
 - [ ] Pull-to-refresh on Home + Match Centre
 - [ ] Long-press on position cards for quick close / set alert
 - [ ] Reduced-motion media query support (the rules are in styles.css, just verify)
 
-### 6. Deploy
+### 4. Deploy
 
 Not urgent for a hobby project, but when ready:
 
@@ -103,6 +66,18 @@ Not urgent for a hobby project, but when ready:
 ## Decision log
 
 Things we've decided and shouldn't relitigate without new evidence.
+
+### 2026-05-01 — Decision agent is pure math (no LLM)
+
+The Decision agent computes Quarter-Kelly sizing on the Researcher's `ResearchNote` and does not call the LLM itself. Reasoning: the LLM signal already lives in the probability + confidence the Researcher returns; Decision's job is mechanical sizing on that signal. Per-candidate LLM cost halved, decision tests need no `chat_json` mock, behavior is deterministic across runs.
+
+### 2026-05-01 — Single PR for Phase 3 (one-PR-per-phase pattern)
+
+Phase 1 = PR #2, Phase 2 = PR #3, Phase 3 = one PR. The original plan offered three branches but we shipped as one PR because all three agents share the orchestrator wiring change. Three PRs would have meant three reviewer context-switches for the same logical phase.
+
+### 2026-05-01 — Sell limit price = `mark - 1¢` (TODO ladder)
+
+When the LLM exit agent says SELL in live mode, the orchestrator places `place_limit_order(action='sell', limit=max(1, mark - 1))`. Marketable enough to fill in most spreads, costs ≤ 1¢/contract. Proper sell-side ladder (cross multiple ticks if not filled) deferred until after first live IPL match.
 
 ### 2026-04-30 — Cricket data decision
 

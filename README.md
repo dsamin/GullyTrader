@@ -19,9 +19,11 @@ Autonomous IPL prediction-market trader for Kalshi. Multi-agent LLM pipeline pic
 | CricAPI integration (live + fixtures + standings) | ✅ wired with 60s in-process cache |
 | Kalshi ↔ CricAPI reconciler (event-ticker parsing) | ✅ 8/10 fixtures correlate to Kalshi events |
 | Scanner agent (LLM-ranked market candidates) | ✅ ~16s round-trip, real grounded reasoning |
-| Researcher / Decision / Exit agents | ⏳ stubs — see [docs/HANDOFF.md](docs/HANDOFF.md) |
+| Researcher agent (LLM probability estimator) | ✅ wired (Phase 3) — settings.research_model |
+| Decision agent (Quarter-Kelly sizer, pure math) | ✅ wired (Phase 3) — gated by `GULLYTRADER_DECISION_MODE` |
+| PortfolioExit agent (LLM hold/sell on open positions) | ✅ wired (Phase 3) — gated by `GULLYTRADER_EXIT_MODE` |
 | Strict-mode auth gating (prod-default; raises on missing creds) | ✅ live |
-| Tests | ✅ 102 passing |
+| Tests | ✅ 129 passing |
 
 ## Stack
 
@@ -38,8 +40,10 @@ Autonomous IPL prediction-market trader for Kalshi. Multi-agent LLM pipeline pic
 │                      gully-engine                              │
 │                                                                │
 │  Orchestrator (2 threads, optional)                            │
-│   ├─ Entry pipeline ── Scanner → Researcher → Decision → buy   │
-│   └─ Exit monitor   ── always-on; hard stops bypass LLM        │
+│   ├─ Entry pipeline ── Scanner → Researcher (LLM) → Decision → │
+│   │                    place_limit_order (gated DECISION_MODE) │
+│   └─ Exit monitor   ── always-on; hard stops bypass LLM,       │
+│                       PortfolioExit LLM for nuanced cases;     │
 │                       shadow logs decisions, live places sells │
 │                                                                │
 │  Sync service ── pulls orders / fills / settlements / positions│
@@ -96,6 +100,19 @@ The startup banner logs the resolved state on one grep-friendly line:
 ```
 startup: GullyTrader auth state — kalshi=authed cricket=cricapi strict=on env=prod
 ```
+
+### Production safety: shadow vs live order placement
+
+Two independent flags control whether Kalshi `place_limit_order` calls are real:
+
+| Env var | Default | Effect |
+|---|---|---|
+| `GULLYTRADER_DECISION_MODE=shadow` | shadow | Decision agent's `buy_yes` / `buy_no` decisions are logged to `agent_logs` but never placed. |
+| `GULLYTRADER_DECISION_MODE=live` | — | Buys are placed via `KalshiClient.place_limit_order`. Bankroll comes from `get_balance().balance`; sizing is Quarter-Kelly clamped at 5% per position. |
+| `GULLYTRADER_EXIT_MODE=shadow` | shadow | Hard-stop and LLM `sell` decisions are logged but never placed. |
+| `GULLYTRADER_EXIT_MODE=live` | — | Sells are placed via `KalshiClient.place_limit_order(action='sell')` at `mark - 1¢`. |
+
+Both default to `shadow` — the bot will run end-to-end against real Kalshi data and a real OpenRouter LLM with no real-money writes until you flip these. Mandatory: watch one full IPL match in shadow mode without errors before flipping either to `live`.
 
 For day-to-day operations (debugging, inspecting logs, triggering manual passes): [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
@@ -187,9 +204,9 @@ GullyTrader/
 │   ├── settings.py                 # Env-driven config
 │   ├── agents/
 │   │   ├── scanner.py              # Implemented (LLM-ranked candidates)
-│   │   ├── researcher.py           # Stub
-│   │   ├── decision.py             # Stub
-│   │   └── portfolio_exit.py       # Stub
+│   │   ├── researcher.py           # LLM probability estimator (Phase 3)
+│   │   ├── decision.py             # Quarter-Kelly sizer, pure math (Phase 3)
+│   │   └── portfolio_exit.py       # LLM hold/sell, safety-default hold (Phase 3)
 │   ├── static/                     # 8-screen React UI (no build step)
 │   ├── tests/                      # 61 tests
 │   └── requirements.txt
