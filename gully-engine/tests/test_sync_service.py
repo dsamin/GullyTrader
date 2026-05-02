@@ -330,3 +330,28 @@ def test_reconcile_updates_existing_cricket_match_row(tmp_db):
     assert len(rows) == 1
     assert rows[0]["score_a"] == "142/4"
     assert rows[0]["win_prob_a"] == 62
+
+
+def test_reconcile_purges_old_agent_logs_after_24h(tmp_db):
+    """Every 24h the reconcile pass should call purge_old_agent_logs."""
+    sync_service._last_purge_at = 0     # force "long time ago"
+
+    client = _StubClient()
+    with patch("sync_service.KalshiClient", return_value=client), \
+         patch("sync_service.database.purge_old_agent_logs") as purge_mock:
+        sync_service._reconcile_once()
+
+    purge_mock.assert_called_once()
+
+
+def test_reconcile_skips_purge_when_recent(tmp_db):
+    """A second reconcile inside the 24h window should NOT call purge again."""
+    import time as _time
+    sync_service._last_purge_at = int(_time.time())   # purged just now
+
+    client = _StubClient()
+    with patch("sync_service.KalshiClient", return_value=client), \
+         patch("sync_service.database.purge_old_agent_logs") as purge_mock:
+        sync_service._reconcile_once()
+
+    purge_mock.assert_not_called()

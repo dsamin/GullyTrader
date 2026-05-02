@@ -34,6 +34,9 @@ log = logging.getLogger(__name__)
 
 _stop_flag = threading.Event()
 
+PURGE_INTERVAL_SECONDS = 86_400      # 24h
+_last_purge_at: float = 0.0
+
 
 def stop() -> None:
     _stop_flag.set()
@@ -181,6 +184,24 @@ def _upsert_cricket_match(conn: sqlite3.Connection, live: LiveScore) -> None:
     )
 
 
+def _maybe_purge_agent_logs() -> None:
+    """Run purge_old_agent_logs at most once per PURGE_INTERVAL_SECONDS.
+
+    Called from each _reconcile_once pass. Module-level _last_purge_at
+    tracks the last successful purge; tests reset it to 0 to force a run.
+    """
+    global _last_purge_at
+    now = time.time()
+    if now - _last_purge_at < PURGE_INTERVAL_SECONDS:
+        return
+    try:
+        purged = database.purge_old_agent_logs()
+        log.info("sync_service: purged %d old agent_logs rows", purged)
+        _last_purge_at = now
+    except Exception:
+        log.exception("sync_service: purge_old_agent_logs failed")
+
+
 # ── Main reconciliation pass ──────────────────────────────────────────
 
 
@@ -222,6 +243,8 @@ def _reconcile_once() -> None:
         live = get_feed().live_match()
     except Exception:
         log.exception("sync_service: live_match failed")
+
+    _maybe_purge_agent_logs()
 
     if not (positions or orders or fills or settlements or live):
         log.debug("sync_service: nothing to reconcile this pass")
