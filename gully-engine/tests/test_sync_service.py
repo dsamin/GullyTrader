@@ -54,6 +54,19 @@ def _stub_live_feed():
         yield gf
 
 
+@pytest.fixture
+def reset_purge_clock():
+    """Snapshot and restore sync_service._last_purge_at across tests.
+
+    Tests that mutate _last_purge_at to exercise the purge gate must use
+    this fixture so they don't pollute subsequent tests. Pytest doesn't
+    guarantee test ordering, so leakage would be a flaky-test source.
+    """
+    original = sync_service._last_purge_at
+    yield
+    sync_service._last_purge_at = original
+
+
 class _StubClient:
     def __init__(self, *, positions=None, orders=None, fills=None, settlements=None,
                  balance=None):
@@ -332,7 +345,7 @@ def test_reconcile_updates_existing_cricket_match_row(tmp_db):
     assert rows[0]["win_prob_a"] == 62
 
 
-def test_reconcile_purges_old_agent_logs_after_24h(tmp_db):
+def test_reconcile_purges_old_agent_logs_after_24h(tmp_db, reset_purge_clock):
     """Every 24h the reconcile pass should call purge_old_agent_logs."""
     sync_service._last_purge_at = 0     # force "long time ago"
 
@@ -344,7 +357,7 @@ def test_reconcile_purges_old_agent_logs_after_24h(tmp_db):
     purge_mock.assert_called_once()
 
 
-def test_reconcile_skips_purge_when_recent(tmp_db):
+def test_reconcile_skips_purge_when_recent(tmp_db, reset_purge_clock):
     """A second reconcile inside the 24h window should NOT call purge again."""
     import time as _time
     sync_service._last_purge_at = int(_time.time())   # purged just now
