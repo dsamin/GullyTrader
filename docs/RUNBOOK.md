@@ -80,11 +80,18 @@ sqlite3 gullytrader.db "
 
 ### Exit decisions (shadow + live)
 
+Exit decisions are logged into `agent_logs` with `agent='exit'`. The
+`reasoning` column carries the trigger as a prefix (e.g. `stop_loss:`,
+`trailing_stop:`, `time:`, `llm:`, `manual:`) so a single `LIKE` query
+buckets exits by cause. (The dedicated `exit_decisions` table was dropped
+in Phase 5 — agent_logs is the single source of truth.)
+
 ```bash
 sqlite3 gullytrader.db "
-  SELECT ticker, trigger, action, mode, mark_price_cents, pnl_cents_at_decision,
+  SELECT ticker, decision, reasoning,
          datetime(created_at, 'unixepoch', 'localtime') as t
-  FROM exit_decisions
+  FROM agent_logs
+  WHERE agent='exit'
   ORDER BY created_at DESC LIMIT 20"
 ```
 
@@ -215,7 +222,7 @@ If the local DB gets into a weird state, just delete it. The schema is rebuilt o
 rm gullytrader.db gullytrader.db-shm gullytrader.db-wal
 ```
 
-This loses all `agent_logs`, `exit_decisions`, and any cached state. Real state lives on Kalshi — none of this is authoritative.
+This loses all `agent_logs` and any cached state. Real state lives on Kalshi — none of this is authoritative.
 
 ## Smoke-test sequence
 
