@@ -25,6 +25,7 @@ from kalshi_client import (
     KalshiPosition,
     KalshiSettlement,
 )
+from cricket_data import LiveScore, get_feed
 from pnl import normalize_position_side
 from settings import settings
 
@@ -145,6 +146,41 @@ def _upsert_settlement(conn: sqlite3.Connection, s: KalshiSettlement) -> None:
     )
 
 
+def _upsert_cricket_match(conn: sqlite3.Connection, live: LiveScore) -> None:
+    """Snapshot the current live match into cricket_matches.
+
+    Stored fields are the structured columns we have; richer fields
+    (last_balls, on_strike_batter) are not persisted — the live API path
+    returns those fresh from CricApiFeed. The DB record is for restart
+    resilience and historical lookback.
+    """
+    score_a = f"{live.runs_a}/{live.wickets_a}"
+    score_b = f"{live.runs_b}/{live.wickets_b}"
+    conn.execute(
+        """
+        INSERT INTO cricket_matches
+            (match_id, series, team_a, team_b, venue, start_time, status,
+             score_a, score_b, overs_a, overs_b, win_prob_a, last_update)
+        VALUES (?, NULL, ?, ?, NULL, NULL, 'live', ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(match_id) DO UPDATE SET
+            team_a=excluded.team_a,
+            team_b=excluded.team_b,
+            status=excluded.status,
+            score_a=excluded.score_a,
+            score_b=excluded.score_b,
+            overs_a=excluded.overs_a,
+            overs_b=excluded.overs_b,
+            win_prob_a=excluded.win_prob_a,
+            last_update=excluded.last_update
+        """,
+        (
+            live.match_id, live.team_a, live.team_b,
+            score_a, score_b, live.overs_a, live.overs_b,
+            live.win_probability_a, int(time.time()),
+        ),
+    )
+
+
 # ── Main reconciliation pass ──────────────────────────────────────────
 
 
@@ -181,7 +217,13 @@ def _reconcile_once() -> None:
     except Exception:
         log.exception("sync_service: list_settlements failed")
 
-    if not (positions or orders or fills or settlements):
+    live: LiveScore | None = None
+    try:
+        live = get_feed().live_match()
+    except Exception:
+        log.exception("sync_service: live_match failed")
+
+    if not (positions or orders or fills or settlements or live):
         log.debug("sync_service: nothing to reconcile this pass")
         return
 
@@ -206,10 +248,16 @@ def _reconcile_once() -> None:
                 _upsert_settlement(conn, s)
             except Exception:
                 log.exception("sync_service: upsert_settlement failed for %s", s.ticker)
+        if live is not None:
+            try:
+                _upsert_cricket_match(conn, live)
+            except Exception:
+                log.exception("sync_service: upsert_cricket_match failed for %s", live.match_id)
 
     log.info(
-        "sync_service: reconciled %d positions, %d orders, %d fills, %d settlements",
+        "sync_service: reconciled %d positions, %d orders, %d fills, %d settlements, live_match=%s",
         len(positions), len(orders), len(fills), len(settlements),
+        live.match_id if live else None,
     )
 
 

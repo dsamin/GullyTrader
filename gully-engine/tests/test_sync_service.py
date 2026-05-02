@@ -241,3 +241,79 @@ def test_reconcile_continues_when_one_call_errors(tmp_db):
     assert "fills" in client.calls
     with database.connect(tmp_db) as conn:
         assert conn.execute("SELECT COUNT(*) c FROM fills").fetchone()["c"] == 1
+
+
+def test_reconcile_writes_live_match_snapshot_to_cricket_matches(tmp_db):
+    """When feed.live_match() returns a match, sync_service must upsert a row."""
+    from cricket_data import LiveScore
+
+    live = LiveScore(
+        match_id="ipl-2026-mumche-32",
+        team_a="MUM", team_b="CHE",
+        runs_a=142, wickets_a=4, overs_a="15.2",
+        runs_b=178, wickets_b=6, overs_b="20.0",
+        batting="team_a", target=178, required_run_rate=7.71,
+        on_strike_batter=None, non_strike_batter=None, bowler=None,
+        last_balls=[], win_probability_a=62, status_text="MUM need 36",
+    )
+    fake_feed = type("F", (), {})()
+    fake_feed.live_match = lambda: live
+
+    client = _StubClient()
+    with patch("sync_service.KalshiClient", return_value=client), \
+         patch("sync_service.get_feed", return_value=fake_feed):
+        sync_service._reconcile_once()
+
+    with database.connect(tmp_db) as conn:
+        row = conn.execute(
+            "SELECT match_id, team_a, team_b, status, score_a, score_b, win_prob_a "
+            "FROM cricket_matches WHERE match_id=?",
+            (live.match_id,),
+        ).fetchone()
+    assert row is not None
+    assert row["team_a"] == "MUM"
+    assert row["team_b"] == "CHE"
+    assert row["status"] == "live"
+    assert row["score_a"] == "142/4"
+    assert row["score_b"] == "178/6"
+    assert row["win_prob_a"] == 62
+
+
+def test_reconcile_skips_cricket_matches_when_no_live_match(tmp_db):
+    fake_feed = type("F", (), {})()
+    fake_feed.live_match = lambda: None
+
+    client = _StubClient()
+    with patch("sync_service.KalshiClient", return_value=client), \
+         patch("sync_service.get_feed", return_value=fake_feed):
+        sync_service._reconcile_once()
+
+    with database.connect(tmp_db) as conn:
+        n = conn.execute("SELECT COUNT(*) c FROM cricket_matches").fetchone()["c"]
+    assert n == 0
+
+
+def test_reconcile_updates_existing_cricket_match_row(tmp_db):
+    """A second pass with a newer score should update the row, not duplicate."""
+    from cricket_data import LiveScore
+
+    snap1 = LiveScore("ipl-32", "MUM", "CHE", 50, 1, "8.0", 0, 0, "0.0",
+                      "team_a", None, None, None, None, None, [], 55, "")
+    snap2 = LiveScore("ipl-32", "MUM", "CHE", 142, 4, "15.2", 0, 0, "0.0",
+                      "team_a", None, None, None, None, None, [], 62, "")
+    feed1 = type("F", (), {})(); feed1.live_match = lambda: snap1
+    feed2 = type("F", (), {})(); feed2.live_match = lambda: snap2
+
+    client = _StubClient()
+    with patch("sync_service.KalshiClient", return_value=client), \
+         patch("sync_service.get_feed", return_value=feed1):
+        sync_service._reconcile_once()
+    with patch("sync_service.KalshiClient", return_value=client), \
+         patch("sync_service.get_feed", return_value=feed2):
+        sync_service._reconcile_once()
+
+    with database.connect(tmp_db) as conn:
+        rows = conn.execute("SELECT score_a, win_prob_a FROM cricket_matches").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["score_a"] == "142/4"
+    assert rows[0]["win_prob_a"] == 62
