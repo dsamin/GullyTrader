@@ -24,11 +24,16 @@ Verified working end-to-end against live services:
 - **PortfolioExit agent (Phase 3, 2026-05-01):** wired. LLM (`settings.exit_model`, default qwen) returns `hold`/`sell`. Defaults to HOLD on any failure mode (LLM unavailable, malformed JSON, invalid action) — never accidentally sells on a bad LLM response.
 - **Orchestrator entry pipeline (Phase 3, 2026-05-01):** end-to-end. `run_entry_pipeline_once` runs Scanner → Researcher → Decision per candidate; `place_limit_order` only fires when `GULLYTRADER_DECISION_MODE=live` (default `shadow`). Response shape includes per-candidate `research`, `decision`, and `order` blocks plus top-level `decision_mode`.
 - **Orchestrator exit pipeline (Phase 3, 2026-05-01):** real mark prices via `client.get_market(ticker)` per position; LLM path delegates to PortfolioExit; live sells (at `mark - 1¢`) only when `GULLYTRADER_EXIT_MODE=live`.
-- **Tests:** **129 passing** (Phase 3 added 27 across researcher / decision / portfolio_exit / orchestrator wiring).
+- **Phase 4 cleanup (2026-05-01):** `/api/bot/status` reads the most recent `agent IN ('decision','exit')` row from `agent_logs` (1h window). `/api/bot/toggle` persists to a singleton `bot_state` table and starts/stops orchestrator threads idempotently. Position filter pills derive from open positions. `cricket_matches` table populated each sync pass. `closed_market_cache` orphan removed. `purge_old_agent_logs` runs once per 24h from the sync loop in addition to the lifespan startup. Tests: 145 passing.
+- **Tests:** **145 passing** (Phase 3 added 27 across researcher / decision / portfolio_exit / orchestrator wiring; Phase 4 added 16 across bot_state / bot endpoints / cricket_matches upsert / orchestrator idempotency / agent_logs taxonomy).
 
 ## Next-up — ranked
 
-### 1. Phase 4 carry-overs from Phase 3 wiring
+### 1. Phase 5 carry-overs from Phase 4 cleanup
+
+- **Symmetric sync_service toggle.** Today the dashboard toggle starts/stops the orchestrator entry/exit threads but doesn't touch `sync_service`. Sync continues polling Kalshi while the bot is "off". Add `sync_service.is_running()` + idempotent `start_in_thread`, then have `/api/bot/toggle` start/stop both. Documented as a known limitation in RUNBOOK; not a correctness bug, just operationally wasteful.
+
+### 2. Phase 4 carry-overs from Phase 3 wiring
 
 These are real bugs surfaced by the Phase 3 wiring that we deferred to keep the PR focused. They should be the first follow-up:
 
@@ -36,24 +41,24 @@ These are real bugs surfaced by the Phase 3 wiring that we deferred to keep the 
 - **`opened_at=now-600` placeholder** (same function). Time-stop fires based on wall clock minus 10 minutes, not the real position-open time. Needs the open timestamp tracked from the first fill on each ticker (already in the `fills` table — derive on read via `MIN(created_time) WHERE ticker=...`).
 - **`KalshiMarket` exposes only `yes_price`/`no_price` (bid side).** Decision posts at `bid + 1¢` which sits at top of queue but won't fill unless someone crosses. For marketable orders, expose `yes_ask`/`no_ask` from `_market_from_dict` (the API field is `yes_ask` / `no_ask`) and update Decision to use them.
 
-### 2. Operational follow-ups
+### 3. Operational follow-ups
 
 These don't block the agents but make the engine production-ready:
 
-- [ ] Wire `database.purge_old_agent_logs()` into the lifespan startup hook (defined, not called yet)
-- [ ] Persist `closed_market_cache` table actually getting written/read (table exists, nothing populates it)
+- [x] ~~Wire `database.purge_old_agent_logs()` into the lifespan startup hook (defined, not called yet)~~ — done at startup AND now recurring every 24h from the sync loop (Phase 4)
+- [x] ~~Persist `closed_market_cache` table actually getting written/read (table exists, nothing populates it)~~ — resolved by removing the orphan; `cricket_matches` is the populated current-state snapshot (Phase 4)
 - [ ] Add request-level logging middleware on FastAPI (currently relies on uvicorn defaults)
 - [ ] Backfill test coverage toward 170+ (KalshiTrader's bench). Priority adds: orchestrator manual-trigger lock semantics, sync_service keep-alive, exit_monitor hard-stop matrix, kalshi_client RSA signing format
 - [ ] Add Playwright visual regression for the 8 screens
 
-### 3. UX polish
+### 4. UX polish
 
 - [ ] Confetti animation when a winning settlement lands (CSS already in `styles.css`, just needs trigger)
 - [ ] Pull-to-refresh on Home + Match Centre
 - [ ] Long-press on position cards for quick close / set alert
 - [ ] Reduced-motion media query support (the rules are in styles.css, just verify)
 
-### 4. Deploy
+### 5. Deploy
 
 Not urgent for a hobby project, but when ready:
 
@@ -66,6 +71,14 @@ Not urgent for a hobby project, but when ready:
 ## Decision log
 
 Things we've decided and shouldn't relitigate without new evidence.
+
+### 2026-05-01 — `bot_state` is the source of truth for the toggle, not the env var
+
+`GULLYTRADER_ENABLE_ORCHESTRATOR` seeds the table on first boot via `database.ensure_bot_state(default_active=...)`. After that, the dashboard toggle wins — even across restarts. Operators can leave the env var on and turn the bot off from the UI without an env-edit + redeploy. To force a hard re-seed, delete the row: `DELETE FROM bot_state`.
+
+### 2026-05-01 — Decision and Exit rows in agent_logs are explicit-write, not LLM-derived
+
+The Decision agent is pure-math (no LLM call) and the deterministic exit-monitor branches (stop_loss/trailing_stop/time) bypass the LLM. Neither path touches `llm.chat_json`'s auto-logger. The orchestrator now writes explicit `agent='decision'` and `agent='exit'` rows so `/api/bot/status` can surface "what did the bot last do." LLM-driven exit branches still produce a `portfolio_exit` row from `llm.chat_json` AND an `exit` row from the orchestrator — complementary, not duplicate, because the former carries `model`/`latency_ms`/full reasoning while the latter carries structured `{trigger}: {note}`.
 
 ### 2026-05-01 — Decision agent is pure math (no LLM)
 
