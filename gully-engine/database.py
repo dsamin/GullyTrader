@@ -179,6 +179,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError:
             pass
 
+    # Phase 5: one-time purge of orphan zero-contract zero-pnl positions.
+    # These came from Kalshi's API for tickers the user is now flat on
+    # (28 such rows pre-cleanup). The realized_pnl_cents=0 filter protects
+    # closed-with-pnl rows that should be preserved as audit history.
+    try:
+        conn.execute(
+            "DELETE FROM positions WHERE yes_count = 0 AND no_count = 0 "
+            "AND realized_pnl_cents = 0"
+        )
+    except sqlite3.OperationalError:
+        pass
+
 
 @contextlib.contextmanager
 def write_conn() -> Iterator[sqlite3.Connection]:
