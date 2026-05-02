@@ -298,11 +298,35 @@ async def get_standings() -> dict:
 
 @app.get("/api/bot/status")
 async def get_bot_status() -> dict:
+    """Bot status pill — last decision/exit + current toggle state.
+
+    Reads the most recent `agent_logs` row where agent IN ('decision','exit')
+    within the last hour. Older or missing -> null fields (so the UI clearly
+    shows an idle bot, not stale fixture data).
+    """
+    import time as _time
+    now_ts = int(_time.time())
+    cutoff = now_ts - 3600
+    with database.connect() as conn:
+        row = conn.execute(
+            "SELECT agent, ticker, decision, created_at FROM agent_logs "
+            "WHERE agent IN ('decision','exit') AND created_at > ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (cutoff,),
+        ).fetchone()
+
+    if row is None:
+        last_action = None
+        last_action_seconds_ago = None
+    else:
+        last_action = f"{row['decision']} {row['ticker']}"
+        last_action_seconds_ago = max(0, now_ts - int(row["created_at"]))
+
     return {
-        "active": settings.enable_orchestrator,
+        "active": database.get_bot_active(),
         "mode": settings.exit_mode,
-        "last_action": "bought MUM YES @ 58¢",
-        "last_action_seconds_ago": 120,
+        "last_action": last_action,
+        "last_action_seconds_ago": last_action_seconds_ago,
         "scanner_model": settings.scanner_model,
         "decision_model": settings.decision_model,
         "exit_model": settings.exit_model,
