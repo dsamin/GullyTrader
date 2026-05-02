@@ -368,3 +368,55 @@ def test_reconcile_skips_purge_when_recent(tmp_db, reset_purge_clock):
         sync_service._reconcile_once()
 
     purge_mock.assert_not_called()
+
+
+def test_upsert_position_skips_flat_positions(tmp_db):
+    """Flat positions (yes_count + no_count == 0) must not be written.
+
+    These come from Kalshi's API for tickers the user previously held but
+    has since fully exited. Writing them creates ghost rows with no value.
+    """
+    import sqlite3
+
+    flat = KalshiPosition(
+        ticker="KXIPL-25-FLAT",
+        yes_count=0,
+        no_count=0,
+        avg_cost_cents=0,
+        market_exposure_cents=0,
+    )
+
+    conn = sqlite3.connect(str(tmp_db), isolation_level=None)
+    try:
+        sync_service._upsert_position(conn, flat)
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM positions WHERE ticker = 'KXIPL-25-FLAT'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert rows[0] == 0, "flat position should not have been written"
+
+
+def test_upsert_position_writes_real_positions(tmp_db):
+    """Sanity: non-flat positions still get written."""
+    import sqlite3
+
+    real = KalshiPosition(
+        ticker="KXIPL-25-REAL",
+        yes_count=10,
+        no_count=0,
+        avg_cost_cents=45,
+        market_exposure_cents=450,
+    )
+
+    conn = sqlite3.connect(str(tmp_db), isolation_level=None)
+    try:
+        sync_service._upsert_position(conn, real)
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM positions WHERE ticker = 'KXIPL-25-REAL'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert rows[0] == 1, "real position should have been written"

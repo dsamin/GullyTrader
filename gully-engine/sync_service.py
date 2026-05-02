@@ -59,6 +59,11 @@ def _iso_to_epoch(ts: str) -> int | None:
 
 
 def _upsert_position(conn: sqlite3.Connection, p: KalshiPosition) -> None:
+    if p.yes_count + p.no_count == 0:
+        # Flat: Kalshi reports this for tickers we previously held but
+        # have since fully exited. Persisting these creates ghost rows
+        # (28 such rows existed pre-Phase-5; cleaned via migration).
+        return
     side = normalize_position_side(p.yes_count, p.no_count)
     conn.execute(
         """
