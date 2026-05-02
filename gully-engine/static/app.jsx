@@ -182,7 +182,6 @@ function App() {
     <>
       <div className="phone" data-theme={theme}>
         <div className="phone-stage">
-          <StatusBar/>
           <div className="phone-scroll">
             <div className="phone-scroll-inner">
               {data.error && (
