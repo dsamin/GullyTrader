@@ -145,10 +145,6 @@ const Upcoming = ({ fixtures }) => (
             {f.venue} · {f.weather} · H2H {f.head_to_head}
           </div>
         </div>
-        <div className="row" style={{ gap: 6, marginTop: 10 }}>
-          <button className="btn btn-secondary" style={{ flex: 1, padding: '8px', fontSize: 11 }}>🔔 Notify</button>
-          <button className="btn btn-primary" style={{ flex: 1, padding: '8px', fontSize: 11 }}>Set autotrade</button>
-        </div>
       </div>
     ))}
   </>
