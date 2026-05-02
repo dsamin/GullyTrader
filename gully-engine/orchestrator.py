@@ -15,6 +15,8 @@ import logging
 import threading
 import time
 
+from agents.decision import decide
+from agents.researcher import research
 from agents.scanner import shortlist as scanner_shortlist
 from cricket_data import get_feed
 from exit_monitor import PositionSnapshot, evaluate
@@ -51,6 +53,9 @@ def run_entry_pipeline_once(*, force: bool = False) -> dict:
 
         client = KalshiClient()
         markets = client.list_ipl_markets()
+        balance_resp = client.get_balance() or {}
+        balance = int(balance_resp.get("balance", 0) or 0)
+        market_by_ticker = {m.ticker: m for m in markets}
 
         candidates = scanner_shortlist(markets, max_results=5)
         log.info(
@@ -58,15 +63,44 @@ def run_entry_pipeline_once(*, force: bool = False) -> dict:
             len(markets), len(candidates),
             (" [" + ", ".join(f"{c.ticker} ({c.score})" for c in candidates) + "]") if candidates else "",
         )
-        # TODO: researcher / decision agents (next phase)
+
+        results = []
+        for c in candidates:
+            market = market_by_ticker.get(c.ticker)
+            if market is None:
+                continue
+            note = research(market, live)
+            dec = decide(note, bankroll_cents=balance, market=market)
+            order_resp = None
+            if dec.action != "pass" and settings.decision_mode == "live":
+                side = "yes" if dec.action == "buy_yes" else "no"
+                try:
+                    order_resp = client.place_limit_order(
+                        ticker=dec.ticker, side=side, action="buy",
+                        count=dec.contracts, limit_price_cents=dec.limit_price_cents,
+                    )
+                except Exception as e:  # noqa: BLE001 — keep loop alive on order errors
+                    log.exception("orchestrator.entry: place_limit_order failed for %s", dec.ticker)
+                    order_resp = {"error": str(e)}
+            results.append({
+                "ticker": c.ticker, "score": c.score, "scan_reason": c.reason,
+                "research": {
+                    "estimated_yes_probability": note.estimated_yes_probability,
+                    "confidence": note.confidence, "reasoning": note.reasoning,
+                },
+                "decision": {
+                    "action": dec.action, "contracts": dec.contracts,
+                    "limit_price_cents": dec.limit_price_cents, "reasoning": dec.reasoning,
+                },
+                "order": order_resp,
+            })
+
         return {
             "status": "ok",
             "markets_scanned": len(markets),
-            "candidates": [
-                {"ticker": c.ticker, "score": c.score, "reason": c.reason}
-                for c in candidates
-            ],
+            "decision_mode": settings.decision_mode,
             "live": bool(live),
+            "candidates": results,
         }
     finally:
         _entry_lock.release()
