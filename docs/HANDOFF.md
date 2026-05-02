@@ -18,7 +18,8 @@ Verified working end-to-end against live services:
 - **Reconciler:** 8 of 10 CricAPI fixtures correctly correlate to a Kalshi `KXIPLGAME` event. The 2 misses are real-world correctness, not bugs (Kalshi removes events from the open filter once they're imminent or past).
 - **Scanner agent:** prompts qwen-2.5-72b via OpenRouter, returns ranked candidates with grounded reasoning ("SRH have a strong recent form, undervalued at 50¢"). ~16s round-trip. Persists to `agent_logs`.
 - **Frontend:** all 8 screens render against live data. Hash-router navigation. Light + dark mode.
-- **Tests:** **94 passing** (P&L correction, cricket feed, scanner, reconciler, kalshi client orders/fills/settlements, sync service reconciliation, portfolio metrics, API integration).
+- **Strict external-service auth gating (Phase 1.5, 2026-05-01):** missing Kalshi creds or CricAPI key default to a loud startup failure when `KALSHI_API_ENV=prod`. `place_limit_order` always raises in prod-unauthed regardless of strict flag. One-line startup banner logs resolved auth state. Override via `GULLYTRADER_STRICT_EXTERNAL_SERVICES`.
+- **Tests:** **102 passing** (P&L correction, cricket feed, scanner, reconciler, kalshi client orders/fills/settlements, sync service reconciliation, portfolio metrics, API integration).
 
 ## Next-up — ranked
 

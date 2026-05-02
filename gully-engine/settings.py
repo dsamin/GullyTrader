@@ -28,6 +28,17 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _strict_default() -> bool:
+    """Default for STRICT_EXTERNAL_SERVICES.
+
+    If GULLYTRADER_STRICT_EXTERNAL_SERVICES is explicitly set, honor it.
+    Otherwise default to True in prod (KALSHI_API_ENV=prod), False elsewhere.
+    """
+    if os.getenv("GULLYTRADER_STRICT_EXTERNAL_SERVICES") is not None:
+        return _bool("GULLYTRADER_STRICT_EXTERNAL_SERVICES")
+    return os.getenv("KALSHI_API_ENV", "demo").lower() == "prod"
+
+
 def _kalshi_base_url(env: str) -> str:
     """Resolve Kalshi base URL from env mode."""
     mode = (env or "demo").lower()
@@ -42,6 +53,11 @@ class Settings:
     kalshi_api_env: str = os.getenv("KALSHI_API_ENV", "demo")
     kalshi_key_id: str = os.getenv("KALSHI_KEY_ID", "")
     kalshi_private_key_path: str = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
+
+    # Strict mode — when True, missing external creds are a loud failure
+    # rather than a silent fallback to mock data. Defaults to True when
+    # KALSHI_API_ENV=prod (real-money envs never silently use mocks).
+    strict_external_services: bool = _strict_default()
 
     # LLM — accept both Kalshi-style (per-agent *_LLM_*) and our shorter aliases
     llm_provider_default: str = os.getenv("LLM_PROVIDER", "openrouter")
