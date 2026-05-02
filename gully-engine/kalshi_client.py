@@ -162,9 +162,11 @@ class _RateLimiter:
 class KalshiClient:
     """Kalshi v2 API client with RSA-PSS request signing.
 
-    Falls back to mock data when private key / key id are missing — that lets
-    the dashboard render with realistic shape during development without
-    Kalshi credentials.
+    Falls back to mock data when credentials are missing — that lets the
+    dashboard render with realistic shape during development without Kalshi
+    credentials. In strict mode (`settings.strict_external_services=True`,
+    auto-enabled when KALSHI_API_ENV=prod), missing credentials raise
+    RuntimeError at construction time instead.
     """
 
     def __init__(self) -> None:
@@ -173,6 +175,12 @@ class KalshiClient:
         self.private_key = self._load_private_key(settings.kalshi_private_key_path)
         self._authed = bool(self.key_id and self.private_key)
         if not self._authed:
+            if settings.strict_external_services:
+                raise RuntimeError(
+                    "Kalshi credentials missing — refusing to start in strict mode "
+                    f"(key_id_set={bool(self.key_id)}, "
+                    f"key_path={settings.kalshi_private_key_path or '<unset>'})"
+                )
             log.warning(
                 "KalshiClient running unauthenticated (key_id=%s, key_path=%s) — returning mock data",
                 bool(self.key_id), settings.kalshi_private_key_path,

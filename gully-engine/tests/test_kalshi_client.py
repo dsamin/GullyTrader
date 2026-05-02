@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from kalshi_client import (
     KalshiClient,
     KalshiFill,
@@ -264,3 +266,77 @@ def test_list_settlements_returns_empty_on_error():
     c = _client()
     with patch.object(c, "_request", return_value={"error": "boom"}):
         assert c.list_settlements() == []
+
+
+# ── Strict-mode auth gating ────────────────────────────────────────────
+
+
+def _set_settings(**overrides):
+    """Mutate the frozen Settings singleton for the duration of a test.
+
+    Returns a callable that restores the originals. Same pattern as
+    test_sync_service.tmp_db.
+    """
+    from settings import settings as _settings
+    originals = {k: getattr(_settings, k) for k in overrides}
+    for k, v in overrides.items():
+        object.__setattr__(_settings, k, v)
+
+    def _restore():
+        for k, v in originals.items():
+            object.__setattr__(_settings, k, v)
+    return _restore
+
+
+def test_init_raises_in_strict_mode_when_unauthed():
+    """Strict mode + missing creds = refuse to start (loud failure)."""
+    restore = _set_settings(
+        strict_external_services=True,
+        kalshi_key_id="",
+        kalshi_private_key_path="",
+    )
+    try:
+        with pytest.raises(RuntimeError, match="Kalshi credentials missing"):
+            KalshiClient()
+    finally:
+        restore()
+
+
+def test_init_succeeds_in_strict_mode_when_authed(tmp_path, monkeypatch):
+    """Strict mode + valid creds = startup proceeds normally."""
+    # Generate a throwaway PEM the client can load.
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    key_path = tmp_path / "kalshi.pem"
+    key_path.write_bytes(pem)
+
+    restore = _set_settings(
+        strict_external_services=True,
+        kalshi_key_id="key-abc",
+        kalshi_private_key_path=str(key_path),
+    )
+    try:
+        c = KalshiClient()
+        assert c._authed is True
+    finally:
+        restore()
+
+
+def test_init_does_not_raise_in_non_strict_mode_when_unauthed():
+    """Default dev posture: missing creds → mock fallbacks, no exception."""
+    restore = _set_settings(
+        strict_external_services=False,
+        kalshi_key_id="",
+        kalshi_private_key_path="",
+    )
+    try:
+        c = KalshiClient()
+        assert c._authed is False
+    finally:
+        restore()
