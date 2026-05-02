@@ -260,3 +260,53 @@ def test_api_bot_status_ignores_decisions_older_than_one_hour(app_client):
     data = resp.json()
     assert data["last_action"] is None
     assert data["last_action_seconds_ago"] is None
+
+
+# ── /api/bot/toggle ────────────────────────────────────────────────────
+
+
+def test_api_bot_toggle_starts_orchestrator_when_active_true(app_client):
+    client, _ = app_client
+    fake = MagicMock()
+    with patch("main.KalshiClient", return_value=fake), \
+         patch("main.orchestrator.start_threads") as start_mock, \
+         patch("main.orchestrator.stop") as stop_mock, \
+         patch("main.orchestrator.is_running", return_value=False):
+        resp = client.post("/api/bot/toggle", json={"active": True})
+    assert resp.status_code == 200
+    assert resp.json()["active"] is True
+    start_mock.assert_called_once()
+    stop_mock.assert_not_called()
+    assert database.get_bot_active() is True
+
+
+def test_api_bot_toggle_stops_orchestrator_when_active_false(app_client):
+    client, _ = app_client
+    database.set_bot_active(True)   # pretend the bot was running
+    fake = MagicMock()
+    with patch("main.KalshiClient", return_value=fake), \
+         patch("main.orchestrator.start_threads") as start_mock, \
+         patch("main.orchestrator.stop") as stop_mock, \
+         patch("main.orchestrator.is_running", return_value=True):
+        resp = client.post("/api/bot/toggle", json={"active": False})
+    assert resp.status_code == 200
+    assert resp.json()["active"] is False
+    stop_mock.assert_called_once()
+    start_mock.assert_not_called()
+    assert database.get_bot_active() is False
+
+
+def test_api_bot_toggle_is_idempotent_on_no_state_change(app_client):
+    """Toggling to the current state should not call start/stop."""
+    client, _ = app_client
+    database.set_bot_active(True)
+    fake = MagicMock()
+    with patch("main.KalshiClient", return_value=fake), \
+         patch("main.orchestrator.start_threads") as start_mock, \
+         patch("main.orchestrator.stop") as stop_mock, \
+         patch("main.orchestrator.is_running", return_value=True):
+        resp = client.post("/api/bot/toggle", json={"active": True})
+    assert resp.status_code == 200
+    assert resp.json()["active"] is True
+    start_mock.assert_not_called()
+    stop_mock.assert_not_called()

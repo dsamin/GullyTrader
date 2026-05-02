@@ -55,6 +55,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 async def lifespan(app: FastAPI):
     log.info("startup: initializing DB at %s", settings.db_path)
     database.initialize()
+    database.ensure_bot_state(default_active=settings.enable_orchestrator)
 
     # One-line, grep-friendly banner: kalshi=authed/unauthed cricket=stub/cricapi strict=on/off env=demo/prod
     try:
@@ -75,11 +76,11 @@ async def lifespan(app: FastAPI):
     purged = database.purge_old_agent_logs()
     log.info("startup: purged %d old agent_logs rows", purged)
 
-    if settings.enable_orchestrator:
+    if database.get_bot_active():
         sync_service.start_in_thread()
         orchestrator.start_threads()
     else:
-        log.info("startup: orchestrator disabled (GULLYTRADER_ENABLE_ORCHESTRATOR=0)")
+        log.info("startup: bot toggled off (bot_state.active=0); orchestrator not started")
 
     yield
 
@@ -339,8 +340,23 @@ class BotToggleBody(BaseModel):
 
 @app.post("/api/bot/toggle")
 async def toggle_bot(body: BotToggleBody) -> dict:
-    # In a real impl this would flip an env-backed flag, restart threads, etc.
-    return {"active": body.active, "note": "stub — threads not actually toggled"}
+    """Persist the bot toggle to bot_state and start/stop orchestrator threads.
+
+    Idempotent on no-state-change (avoids double-start). Toggling to the
+    same state is a no-op except for the updated_at timestamp.
+    """
+    target = bool(body.active)
+    currently_running = orchestrator.is_running()
+
+    if target and not currently_running:
+        orchestrator.start_threads()
+        log.info("api.bot/toggle: started orchestrator threads")
+    elif not target and currently_running:
+        orchestrator.stop()
+        log.info("api.bot/toggle: stopped orchestrator threads")
+
+    database.set_bot_active(target)
+    return {"active": target}
 
 
 class OrderBody(BaseModel):
