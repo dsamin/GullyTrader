@@ -171,6 +171,12 @@ def run_exit_monitor_once(*, force: bool = False) -> dict:
                 peak_pnl_cents=0,       # TODO(phase-4): track peak P&L for trailing-stop
             )
             exit_dec = evaluate(snap, now=now)
+            _log_decision(
+                agent="exit",
+                ticker=exit_dec.ticker,
+                decision=exit_dec.action,
+                reasoning=f"{exit_dec.trigger}: {exit_dec.note}",
+            )
             order_resp = None
             if exit_dec.action == "sell" and settings.exit_mode == "live":
                 try:

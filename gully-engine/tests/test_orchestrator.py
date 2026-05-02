@@ -263,3 +263,31 @@ def test_run_entry_pipeline_writes_decision_to_agent_logs(tmp_db):
     assert rows[0]["ticker"] == market.ticker
     assert rows[0]["decision"] == "buy_yes"
     assert "edge=+7c" in rows[0]["reasoning"]
+
+
+def test_run_exit_monitor_writes_exit_to_agent_logs(tmp_db):
+    """Each evaluated position must land an agent_logs row keyed agent='exit'."""
+    import database
+    pos = _position("KXIPL-T", side="yes")
+    market = _market(pos.ticker, yes=58)
+    exit_dec = ExitDecision(
+        ticker=pos.ticker, trigger="llm", action="hold", mode="shadow",
+        mark_price_cents=58, pnl_cents_at_decision=800, note="hold: still positive momentum",
+    )
+    fake_client = type("C", (), {})()
+    fake_client.list_positions = lambda: [pos]
+    fake_client.get_market = lambda t: market
+    fake_client.place_limit_order = lambda **kw: {}
+
+    with patch("orchestrator.KalshiClient", return_value=fake_client), \
+         patch("orchestrator.evaluate", return_value=exit_dec):
+        orchestrator.run_exit_monitor_once(force=True)
+
+    with database.connect(tmp_db) as conn:
+        rows = conn.execute(
+            "SELECT agent, ticker, decision, reasoning FROM agent_logs WHERE agent='exit'"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["ticker"] == pos.ticker
+    assert rows[0]["decision"] == "hold"
+    assert "llm" in rows[0]["reasoning"]
