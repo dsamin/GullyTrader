@@ -16,21 +16,6 @@ from settings import settings
 
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS markets (
-    ticker TEXT PRIMARY KEY,
-    event_ticker TEXT NOT NULL,
-    title TEXT,
-    yes_price INTEGER,
-    no_price INTEGER,
-    status TEXT,
-    close_time INTEGER,
-    last_seen_at INTEGER,
-    metadata_json TEXT
-);
-
-CREATE INDEX IF NOT EXISTS markets_event_idx ON markets(event_ticker);
-CREATE INDEX IF NOT EXISTS markets_status_idx ON markets(status);
-
 CREATE TABLE IF NOT EXISTS positions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker TEXT NOT NULL,
@@ -42,6 +27,7 @@ CREATE TABLE IF NOT EXISTS positions (
     market_exposure_cents INTEGER,
     realized_pnl_cents INTEGER NOT NULL DEFAULT 0,
     unrealized_pnl_cents INTEGER NOT NULL DEFAULT 0,
+    peak_pnl_cents INTEGER NOT NULL DEFAULT 0,
     opened_at INTEGER,
     closed_at INTEGER,
     status TEXT NOT NULL DEFAULT 'open',
@@ -109,18 +95,6 @@ CREATE TABLE IF NOT EXISTS agent_logs (
 
 CREATE INDEX IF NOT EXISTS agent_logs_created_idx ON agent_logs(created_at);
 
-CREATE TABLE IF NOT EXISTS exit_decisions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ticker TEXT NOT NULL,
-    trigger TEXT NOT NULL,             -- stop_loss | trailing_stop | time | llm | manual
-    action TEXT NOT NULL,              -- hold | sell
-    mode TEXT NOT NULL,                -- shadow | live
-    mark_price_cents INTEGER,
-    pnl_cents_at_decision INTEGER,
-    note TEXT,
-    created_at INTEGER NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS cricket_matches (
     match_id TEXT PRIMARY KEY,
     series TEXT,
@@ -178,6 +152,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("fills", "kalshi_order_id", "TEXT"),
         ("fills", "action", "TEXT"),
         ("fills", "is_taker", "INTEGER DEFAULT 0"),
+        ("positions", "peak_pnl_cents", "INTEGER NOT NULL DEFAULT 0"),
     ]
     for table, col, decl in additions:
         try:
@@ -195,6 +170,26 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # Phase 4: drop orphan closed_market_cache table (never written/read).
     try:
         conn.execute("DROP TABLE IF EXISTS closed_market_cache")
+    except sqlite3.OperationalError:
+        pass
+
+    # Phase 5: drop dead schema tables (markets, exit_decisions).
+    # Both were scaffolded but never written to or read from outside CREATE.
+    for dead_table in ("markets", "exit_decisions"):
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS {dead_table}")
+        except sqlite3.OperationalError:
+            pass
+
+    # Phase 5: one-time purge of orphan zero-contract zero-pnl positions.
+    # These came from Kalshi's API for tickers the user is now flat on
+    # (28 such rows pre-cleanup). The realized_pnl_cents=0 filter protects
+    # closed-with-pnl rows that should be preserved as audit history.
+    try:
+        conn.execute(
+            "DELETE FROM positions WHERE yes_count = 0 AND no_count = 0 "
+            "AND realized_pnl_cents = 0"
+        )
     except sqlite3.OperationalError:
         pass
 

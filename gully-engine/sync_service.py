@@ -59,24 +59,51 @@ def _iso_to_epoch(ts: str) -> int | None:
 
 
 def _upsert_position(conn: sqlite3.Connection, p: KalshiPosition) -> None:
+    if p.yes_count + p.no_count == 0:
+        # Flat: Kalshi reports this for tickers we previously held but
+        # have since fully exited. Persisting these creates ghost rows
+        # (28 such rows existed pre-Phase-5; cleaned via migration).
+        return
     side = normalize_position_side(p.yes_count, p.no_count)
+    # Unrealized P&L only computed for directional positions. For paired
+    # positions (both yes_count > 0 AND no_count > 0) the avg_cost_cents is
+    # a blended weighted average across both legs, so multiplying by max()
+    # would understate cost basis and inflate peak. Trailing-stop doesn't
+    # apply to hedged positions anyway — leave peak at 0 for those.
+    if p.yes_count > 0 and p.no_count > 0:
+        unrealized = 0
+        new_peak = 0
+    else:
+        contracts = max(p.yes_count, p.no_count)
+        cost_basis = p.avg_cost_cents * contracts
+        unrealized = p.market_exposure_cents - cost_basis
+        # Peak only rises. Clamp negative unrealized to 0 — peak represents
+        # high-water mark, never goes below zero.
+        new_peak = max(0, unrealized)
+    # Schema only allows side='yes'|'no'; collapse 'paired' to 'yes' (matches
+    # main.py:129 pattern). 'flat' was filtered above, so it can't reach here.
+    db_side = "yes" if side == "paired" else side
     conn.execute(
         """
         INSERT INTO positions (ticker, side, yes_count, no_count,
                                avg_cost_cents, market_exposure_cents,
+                               unrealized_pnl_cents, peak_pnl_cents,
                                opened_at, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'open')
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
         ON CONFLICT(ticker) DO UPDATE SET
             side=excluded.side,
             yes_count=excluded.yes_count,
             no_count=excluded.no_count,
             avg_cost_cents=excluded.avg_cost_cents,
-            market_exposure_cents=excluded.market_exposure_cents
+            market_exposure_cents=excluded.market_exposure_cents,
+            unrealized_pnl_cents=excluded.unrealized_pnl_cents,
+            peak_pnl_cents=MAX(positions.peak_pnl_cents, excluded.peak_pnl_cents)
         """,
         (
-            p.ticker, side if side != "flat" else "yes",
+            p.ticker, db_side,
             p.yes_count, p.no_count,
             p.avg_cost_cents, p.market_exposure_cents,
+            unrealized, new_peak,
             int(time.time()),
         ),
     )

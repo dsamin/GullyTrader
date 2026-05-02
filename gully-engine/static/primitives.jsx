@@ -1,25 +1,4 @@
-// GullyTrader — primitive UI atoms (status bar, chips, tab bar, crests)
-
-const StatusBar = ({ time = "9:41" }) => (
-  <div className="status-bar">
-    <div className="mono" style={{ fontWeight: 700, fontSize: 15, letterSpacing: '-0.01em' }}>{time}</div>
-    <div className="icons">
-      <svg width="17" height="11" viewBox="0 0 17 11" fill="none" aria-hidden>
-        {[2,5,8,11].map((h,i) => (
-          <rect key={i} x={i*4} y={11-h} width="3" height={h} rx="0.5" fill="currentColor"/>
-        ))}
-      </svg>
-      <svg width="15" height="11" viewBox="0 0 15 11" fill="none" aria-hidden>
-        <path d="M7.5 10.5a1 1 0 110-2 1 1 0 010 2zm-3.5-3a4.95 4.95 0 017 0l-1 1a3.5 3.5 0 00-5 0l-1-1zm-2.5-2.5a8.5 8.5 0 0112 0l-1 1a7 7 0 00-10 0l-1-1z" fill="currentColor"/>
-      </svg>
-      <svg width="26" height="12" viewBox="0 0 26 12" fill="none" aria-hidden>
-        <rect x="0.5" y="0.5" width="22" height="11" rx="2.5" stroke="currentColor" opacity="0.4"/>
-        <rect x="2" y="2" width="17" height="8" rx="1" fill="currentColor"/>
-        <rect x="23.5" y="3.5" width="2" height="5" rx="1" fill="currentColor" opacity="0.4"/>
-      </svg>
-    </div>
-  </div>
-);
+// GullyTrader — primitive UI atoms (chips, tab bar, crests)
 
 // Abstract monogram crest — shield-like hex with team code
 const Crest = ({ code = "MUM", color = "#FF8533", color2 = "#E85D04", size = 36 }) => {
@@ -124,4 +103,4 @@ const Delta = ({ v, suffix = "%" }) => {
   );
 };
 
-Object.assign(window, { StatusBar, TeamCrest, Crest, TEAMS, Chip, LiveChip, TabBar, Avatar, Delta });
+Object.assign(window, { TeamCrest, Crest, TEAMS, Chip, LiveChip, TabBar, Avatar, Delta });

@@ -24,9 +24,13 @@ Autonomous IPL prediction-market trader for Kalshi. Multi-agent LLM pipeline pic
 | PortfolioExit agent (LLM hold/sell on open positions) | ✅ wired (Phase 3) — gated by `GULLYTRADER_EXIT_MODE` |
 | Strict-mode auth gating (prod-default; raises on missing creds) | ✅ live |
 | Bot toggle + status (real, persisted) | ✅ live (Phase 4) |
-| Tests | ✅ 145 passing |
+| Trailing-stop reads real `peak_pnl_cents` from DB (Phase 5) | ✅ live |
+| Honest dashboard (no fake mobile chrome, no fake trends panels) | ✅ live (Phase 5) |
+| Tests | ✅ 157 passing |
 
 **Phase 4 cleanup (2026-05-01):** Real bot status pill (reads recent decisions from `agent_logs`), real bot toggle (persists to `bot_state`, starts/stops orchestrator threads idempotently), `cricket_matches` table populated each sync pass, `closed_market_cache` orphan removed, position filter pills derive from open positions, `purge_old_agent_logs` runs daily from sync loop in addition to the lifespan startup.
+
+**Phase 5 cleanup (2026-05-02):** Honest dashboard + trailing-stop fix + DB hygiene. (1) Frontend: removed fake iPhone status bar, hidden Trends panels with no real data source (Manhattan, last-balls, head-to-head, form guide, pitch & weather, win-prob SVG), removed dead Notify/Autotrade buttons, neutral Scoreboard defaults. (2) Trailing-stop correctness: orchestrator reads real `opened_at` and `peak_pnl_cents` from positions DB instead of hardcoded `now-600` and `0`. New `peak_pnl_cents` column tracked monotonically per sync; paired positions skip peak tracking (cost basis math doesn't apply to hedged positions). (3) DB hygiene: dropped dead `markets` and `exit_decisions` tables; one-time purge of 28 orphan zero-contract positions; sync_service skips writing flat positions.
 
 ## Stack
 

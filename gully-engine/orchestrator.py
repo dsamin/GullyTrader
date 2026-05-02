@@ -15,6 +15,7 @@ import logging
 import threading
 import time
 
+import database
 from agents.decision import decide
 from agents.researcher import research
 from agents.scanner import shortlist as scanner_shortlist
@@ -162,7 +163,27 @@ def run_exit_monitor_once(*, force: bool = False) -> dict:
         positions = client.list_positions()
         decisions = []
         now = int(time.time())
+        # Read opened_at + peak_pnl_cents from DB once per tick. Time-stop and
+        # trailing-stop both need real values: hardcoded now-600 and 0 used to
+        # make those triggers fire incorrectly (or never).
+        with database.write_conn() as conn:
+            db_state = {
+                row["ticker"]: (row["opened_at"], row["peak_pnl_cents"])
+                for row in conn.execute(
+                    "SELECT ticker, opened_at, peak_pnl_cents FROM positions "
+                    "WHERE status = 'open'"
+                ).fetchall()
+            }
         for p in positions:
+            if p.yes_count + p.no_count == 0:
+                continue   # flat — sync filter handles this too, defense-in-depth
+            if p.ticker not in db_state:
+                log.warning(
+                    "exit_monitor: no DB row for %s yet (race with sync); "
+                    "skipping this tick", p.ticker,
+                )
+                continue
+            opened_at, peak_pnl_cents = db_state[p.ticker]
             side = "yes" if p.yes_count >= p.no_count else "no"
             market = client.get_market(p.ticker)
             if market is not None:
@@ -175,8 +196,8 @@ def run_exit_monitor_once(*, force: bool = False) -> dict:
                 mark_price_cents=mark,
                 yes_count=p.yes_count, no_count=p.no_count,
                 side=side,
-                opened_at=now - 600,    # TODO(phase-4): track real open time per position
-                peak_pnl_cents=0,       # TODO(phase-4): track peak P&L for trailing-stop
+                opened_at=opened_at or now,        # row exists but opened_at NULL → safe fallback
+                peak_pnl_cents=peak_pnl_cents or 0,
             )
             exit_dec = evaluate(snap, now=now)
             _log_decision(

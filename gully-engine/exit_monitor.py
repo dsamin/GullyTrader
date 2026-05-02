@@ -7,7 +7,9 @@ Carries forward two hard rules from KalshiTrader:
    only consulted for nuanced "should I take profit early" calls.
 2. **Shadow mode by default.** Any new exit logic must run in shadow for a
    full session before flipping to live. Shadow mode logs decisions to
-   `exit_decisions` but never places sells.
+   `agent_logs` (with agent='exit') via the orchestrator but never places
+   sells. (The `exit_decisions` table this used to write to was dropped in
+   Phase 5 — agent_logs is the single source of truth for exit decisions.)
 
 Restart resilience is baked in: a startup grace window prevents the monitor
 from re-logging stale decisions on every reboot.
