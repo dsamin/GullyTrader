@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS positions (
     market_exposure_cents INTEGER,
     realized_pnl_cents INTEGER NOT NULL DEFAULT 0,
     unrealized_pnl_cents INTEGER NOT NULL DEFAULT 0,
+    peak_pnl_cents INTEGER NOT NULL DEFAULT 0,
     opened_at INTEGER,
     closed_at INTEGER,
     status TEXT NOT NULL DEFAULT 'open',
@@ -151,6 +152,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("fills", "kalshi_order_id", "TEXT"),
         ("fills", "action", "TEXT"),
         ("fills", "is_taker", "INTEGER DEFAULT 0"),
+        ("positions", "peak_pnl_cents", "INTEGER NOT NULL DEFAULT 0"),
     ]
     for table, col, decl in additions:
         try:

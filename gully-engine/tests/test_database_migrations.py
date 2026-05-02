@@ -113,3 +113,53 @@ def test_migration_purges_orphan_positions_only(db_with_orphan_positions):
     assert "KXIPL-ORPHAN" not in tickers, "orphan should have been purged"
     assert "KXIPL-REAL" in tickers, "real open position must survive"
     assert "KXIPL-CLOSED" in tickers, "closed-with-pnl must survive"
+
+
+def test_positions_table_has_peak_pnl_cents_column(fresh_db):
+    """Schema must define peak_pnl_cents column with default 0."""
+    conn = sqlite3.connect(str(fresh_db))
+    try:
+        cols = {
+            row[1]: row[4]  # name → default value
+            for row in conn.execute("PRAGMA table_info(positions)").fetchall()
+        }
+    finally:
+        conn.close()
+
+    assert "peak_pnl_cents" in cols, "positions must have peak_pnl_cents column"
+    assert cols["peak_pnl_cents"] == "0", "default must be 0"
+
+
+def test_migration_adds_peak_pnl_cents_to_legacy_db(tmp_path: Path):
+    """A pre-Phase-5 DB without peak_pnl_cents gains the column on init."""
+    db_path = tmp_path / "legacy_positions.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        # Build legacy positions table with no peak_pnl_cents column
+        conn.executescript("""
+            CREATE TABLE positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL,
+                side TEXT NOT NULL,
+                yes_count INTEGER NOT NULL DEFAULT 0,
+                no_count INTEGER NOT NULL DEFAULT 0,
+                realized_pnl_cents INTEGER NOT NULL DEFAULT 0,
+                opened_at INTEGER,
+                status TEXT NOT NULL DEFAULT 'open',
+                UNIQUE(ticker)
+            );
+        """)
+    finally:
+        conn.close()
+
+    database.initialize(db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(positions)").fetchall()
+        }
+    finally:
+        conn.close()
+
+    assert "peak_pnl_cents" in cols
