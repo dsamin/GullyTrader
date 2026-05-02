@@ -61,6 +61,31 @@ def _position(ticker: str = "KXIPLGAME-T", side: str = "yes") -> KalshiPosition:
     )
 
 
+def _seed_position_row(db_path, ticker: str = "KXIPLGAME-T", side: str = "yes") -> None:
+    """Insert a positions row so run_exit_monitor_once can SELECT opened_at + peak.
+
+    Required since orchestrator.py reads opened_at + peak_pnl_cents from DB and
+    skips Kalshi-reported positions absent from the DB (race-with-sync defense).
+    """
+    import sqlite3
+    import time
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        conn.execute(
+            "INSERT INTO positions (ticker, side, yes_count, no_count, "
+            "avg_cost_cents, market_exposure_cents, peak_pnl_cents, "
+            "opened_at, status) VALUES (?, ?, ?, ?, 50, 5000, 0, ?, 'open')",
+            (
+                ticker, side,
+                100 if side == "yes" else 0,
+                0 if side == "yes" else 100,
+                int(time.time()) - 600,
+            ),
+        )
+    finally:
+        conn.close()
+
+
 # ── Entry pipeline ─────────────────────────────────────────────────────
 
 
@@ -160,7 +185,8 @@ def _sell_decision(ticker: str, mark: int, mode: str) -> ExitDecision:
                         pnl_cents_at_decision=100, note="t")
 
 
-def test_exit_shadow_mode_does_not_place_sell_on_sell_decision():
+def test_exit_shadow_mode_does_not_place_sell_on_sell_decision(tmp_db):
+    _seed_position_row(tmp_db, ticker="KXIPLGAME-T", side="yes")
     restore = _set_settings(exit_mode="shadow")
     try:
         client = MagicMock()
@@ -181,7 +207,8 @@ def test_exit_shadow_mode_does_not_place_sell_on_sell_decision():
         restore()
 
 
-def test_exit_live_mode_places_sell_on_sell_decision():
+def test_exit_live_mode_places_sell_on_sell_decision(tmp_db):
+    _seed_position_row(tmp_db, ticker="KXIPLGAME-T", side="yes")
     restore = _set_settings(exit_mode="live")
     try:
         client = MagicMock()
@@ -203,9 +230,10 @@ def test_exit_live_mode_places_sell_on_sell_decision():
         restore()
 
 
-def test_exit_pipeline_fetches_real_mark_via_get_market():
+def test_exit_pipeline_fetches_real_mark_via_get_market(tmp_db):
     """The snapshot passed into evaluate() must use yes_price/no_price from
     get_market, not avg_cost_cents."""
+    _seed_position_row(tmp_db, ticker="KXIPLGAME-T", side="yes")
     restore = _set_settings(exit_mode="shadow")
     try:
         client = MagicMock()
@@ -269,6 +297,7 @@ def test_run_exit_monitor_writes_exit_to_agent_logs(tmp_db):
     """Each evaluated position must land an agent_logs row keyed agent='exit'."""
     import database
     pos = _position("KXIPL-T", side="yes")
+    _seed_position_row(tmp_db, ticker=pos.ticker, side="yes")
     market = _market(pos.ticker, yes=58)
     exit_dec = ExitDecision(
         ticker=pos.ticker, trigger="llm", action="hold", mode="shadow",
@@ -353,3 +382,123 @@ def test_orchestrator_is_running_reflects_state(tmp_db, _stub_orchestrator_loops
     finally:
         orchestrator.stop()
         assert orchestrator.is_running() is False
+
+
+def test_run_exit_monitor_uses_real_opened_at_from_db(tmp_path, monkeypatch):
+    """Orchestrator must read opened_at from positions table, not fake it.
+
+    Seeds a position with opened_at far in the past, then verifies the
+    PositionSnapshot passed to exit_monitor.evaluate reflects that real
+    timestamp (not now-600).
+    """
+    import sqlite3
+    import time
+    from unittest.mock import MagicMock, patch
+
+    import database
+    import orchestrator
+    from kalshi_client import KalshiPosition, KalshiMarket
+    from settings import settings as _settings
+
+    # Point settings.db_path at a tmp file
+    db_path = tmp_path / "exit.db"
+    original_path = _settings.db_path
+    object.__setattr__(_settings, "db_path", db_path)
+    try:
+        database.initialize(db_path)
+
+        # Seed a position with opened_at = 2 hours ago
+        old_opened_at = int(time.time()) - 7200
+        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            conn.execute(
+                "INSERT INTO positions (ticker, side, yes_count, no_count, "
+                "avg_cost_cents, market_exposure_cents, "
+                "peak_pnl_cents, opened_at, status) VALUES "
+                "('KXIPL-OLD', 'yes', 10, 0, 45, 480, 200, ?, 'open')",
+                (old_opened_at,),
+            )
+        finally:
+            conn.close()
+
+        # Stub Kalshi: returns the position; mark_price = avg_cost (zero P&L)
+        fake_client = MagicMock()
+        fake_client.list_positions.return_value = [
+            KalshiPosition(
+                ticker="KXIPL-OLD",
+                yes_count=10, no_count=0,
+                avg_cost_cents=45, market_exposure_cents=480,
+            )
+        ]
+        fake_client.get_market.return_value = KalshiMarket(
+            ticker="KXIPL-OLD", event_ticker="KXIPL-25", title="t",
+            yes_price=48, no_price=52, status="open",
+        )
+        # Capture PositionSnapshot passed to evaluate
+        captured = []
+        def fake_evaluate(snap, **kw):
+            captured.append(snap)
+            from exit_monitor import ExitDecision
+            return ExitDecision(
+                ticker=snap.ticker, trigger="none", action="hold",
+                mode="shadow", mark_price_cents=snap.mark_price_cents,
+                pnl_cents_at_decision=0, note="test",
+            )
+
+        with patch("orchestrator.KalshiClient", return_value=fake_client), \
+             patch("orchestrator.evaluate", side_effect=fake_evaluate):
+            orchestrator.run_exit_monitor_once(force=True)
+
+        assert len(captured) == 1
+        assert captured[0].opened_at == old_opened_at, \
+            f"expected real opened_at {old_opened_at}, got {captured[0].opened_at}"
+        assert captured[0].peak_pnl_cents == 200, \
+            f"expected stored peak 200, got {captured[0].peak_pnl_cents}"
+    finally:
+        object.__setattr__(_settings, "db_path", original_path)
+
+
+def test_run_exit_monitor_skips_position_missing_from_db(tmp_path, caplog):
+    """If Kalshi reports a position not yet in our DB (race during first sync),
+    orchestrator must skip it gracefully — log a warning, don't crash."""
+    import logging
+    from unittest.mock import MagicMock, patch
+
+    import database
+    import orchestrator
+    from kalshi_client import KalshiPosition, KalshiMarket
+    from settings import settings as _settings
+
+    db_path = tmp_path / "race.db"
+    original_path = _settings.db_path
+    object.__setattr__(_settings, "db_path", db_path)
+    try:
+        database.initialize(db_path)
+        # Note: no INSERT — DB has no positions row for KXIPL-NEW
+
+        fake_client = MagicMock()
+        fake_client.list_positions.return_value = [
+            KalshiPosition(
+                ticker="KXIPL-NEW",
+                yes_count=5, no_count=0,
+                avg_cost_cents=50, market_exposure_cents=250,
+            )
+        ]
+        fake_client.get_market.return_value = KalshiMarket(
+            ticker="KXIPL-NEW", event_ticker="KXIPL-25", title="t",
+            yes_price=50, no_price=50, status="open",
+        )
+
+        def fake_evaluate(snap, **kw):
+            raise AssertionError("evaluate should not be called for missing-row position")
+
+        with patch("orchestrator.KalshiClient", return_value=fake_client), \
+             patch("orchestrator.evaluate", side_effect=fake_evaluate), \
+             caplog.at_level(logging.WARNING, logger="orchestrator"):
+            orchestrator.run_exit_monitor_once(force=True)
+
+        # No crash + warning logged
+        assert any("KXIPL-NEW" in rec.message for rec in caplog.records), \
+            "expected warning about missing position row"
+    finally:
+        object.__setattr__(_settings, "db_path", original_path)
