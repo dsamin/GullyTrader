@@ -2,7 +2,7 @@
 
 The single source of truth for "what's the current state and what should I work on next?". Read this first if you're picking up cold.
 
-Last verified: **2026-05-01**.
+Last verified: **2026-05-02**.
 
 ## Current state
 
@@ -25,7 +25,11 @@ Verified working end-to-end against live services:
 - **Orchestrator entry pipeline (Phase 3, 2026-05-01):** end-to-end. `run_entry_pipeline_once` runs Scanner → Researcher → Decision per candidate; `place_limit_order` only fires when `GULLYTRADER_DECISION_MODE=live` (default `shadow`). Response shape includes per-candidate `research`, `decision`, and `order` blocks plus top-level `decision_mode`.
 - **Orchestrator exit pipeline (Phase 3, 2026-05-01):** real mark prices via `client.get_market(ticker)` per position; LLM path delegates to PortfolioExit; live sells (at `mark - 1¢`) only when `GULLYTRADER_EXIT_MODE=live`.
 - **Phase 4 cleanup (2026-05-01):** `/api/bot/status` reads the most recent `agent IN ('decision','exit')` row from `agent_logs` (1h window). `/api/bot/toggle` persists to a singleton `bot_state` table and starts/stops orchestrator threads idempotently. Position filter pills derive from open positions. `cricket_matches` table populated each sync pass. `closed_market_cache` orphan removed. `purge_old_agent_logs` runs once per 24h from the sync loop in addition to the lifespan startup. Tests: 145 passing.
-- **Tests:** **145 passing** (Phase 3 added 27 across researcher / decision / portfolio_exit / orchestrator wiring; Phase 4 added 16 across bot_state / bot endpoints / cricket_matches upsert / orchestrator idempotency / agent_logs taxonomy).
+- **Phase 5 cleanup (2026-05-02):** Honest dashboard + trailing-stop fix + DB hygiene.
+  - **Frontend honesty.** Removed fake iPhone status bar (no more "9:41" + battery icon). Trends screen panels render only when backed by real data (deleted: hardcoded Manhattan runs/wickets, last-12-balls fallback, win-prob SVG with hardcoded path coords, head-to-head card with always-"3 vs 2 wins", form guide card with always-W/W/L/W/W, pitch + weather card with always-"28°C · Dew @ 19:00"). Dead Notify/Autotrade buttons removed from upcoming fixtures. Scoreboard defaults switched from "MUM 142/4 vs CHE 178/6" to neutral em-dashes/zeros.
+  - **Trailing-stop correctness.** New `peak_pnl_cents` column on `positions`. `sync_service._upsert_position` computes current unrealized P&L (`market_exposure - avg_cost × max(yes,no)`) and updates peak via SQL `MAX()` in ON CONFLICT — peak only ever rises, clamped to 0 for underwater positions. **Paired positions skip peak tracking** (avg_cost is blended across legs, so the directional formula understates cost basis; trailing-stop also doesn't apply to hedged positions). `orchestrator.run_exit_monitor_once` SELECTs `opened_at` and `peak_pnl_cents` from DB once per tick instead of using `now-600` and `0`. Race handling: if Kalshi reports a position not yet in our DB, log warning and skip that ticker; sync catches up next pass.
+  - **DB hygiene.** Dropped dead `markets` table (never written/read). Dropped dead `exit_decisions` table (never written; exits go to `agent_logs` instead). One-time migration purges 28 orphan zero-contract positions (where `yes_count + no_count = 0 AND realized_pnl_cents = 0` — `realized_pnl_cents` filter protects closed-with-pnl audit history). `sync_service._upsert_position` now skips flat positions at the writer to prevent re-accumulation.
+- **Tests:** **157 passing** (Phase 3 added 27, Phase 4 added 16, Phase 5 added 12: 5 migration tests, 5 sync_service tests including a paired-position pin, 2 orchestrator tests for real-DB-state read + race handling; subagent C also hardened 4 existing exit-pipeline tests to seed positions DB rows since the orchestrator now requires the row).
 
 ## Next-up — ranked
 
@@ -35,11 +39,11 @@ Verified working end-to-end against live services:
 
 ### 2. Phase 4 carry-overs from Phase 3 wiring
 
-These are real bugs surfaced by the Phase 3 wiring that we deferred to keep the PR focused. They should be the first follow-up:
+These are real bugs surfaced by the Phase 3 wiring that we deferred to keep the PR focused. Status as of Phase 5:
 
-- **`peak_pnl_cents=0` placeholder in orchestrator exit pipeline** ([`orchestrator.py`](../gully-engine/orchestrator.py) `run_exit_monitor_once`). Trailing stop never fires because peak P&L is never tracked. Needs per-position peak-P&L state — likely a new in-memory dict keyed by ticker (refresh the peak each pass; reset when position closes), or a dedicated DB column on `positions`.
-- **`opened_at=now-600` placeholder** (same function). Time-stop fires based on wall clock minus 10 minutes, not the real position-open time. Needs the open timestamp tracked from the first fill on each ticker (already in the `fills` table — derive on read via `MIN(created_time) WHERE ticker=...`).
-- **`KalshiMarket` exposes only `yes_price`/`no_price` (bid side).** Decision posts at `bid + 1¢` which sits at top of queue but won't fill unless someone crosses. For marketable orders, expose `yes_ask`/`no_ask` from `_market_from_dict` (the API field is `yes_ask` / `no_ask`) and update Decision to use them.
+- [x] ~~`peak_pnl_cents=0` placeholder in orchestrator exit pipeline.~~ Resolved in Phase 5: new column on `positions`, written by `sync_service._upsert_position` via SQL `MAX()` in ON CONFLICT (peak only rises), read per-tick by orchestrator. Paired positions skip peak tracking (cost-basis math doesn't apply).
+- [x] ~~`opened_at=now-600` placeholder.~~ Resolved in Phase 5: `sync_service._upsert_position` already preserved `opened_at` on conflict (existing pattern); orchestrator SELECTs the real value from DB once per tick.
+- **`KalshiMarket` exposes only `yes_price`/`no_price` (bid side).** Decision posts at `bid + 1¢` which sits at top of queue but won't fill unless someone crosses. For marketable orders, expose `yes_ask`/`no_ask` from `_market_from_dict` (the API field is `yes_ask` / `no_ask`) and update Decision to use them. Still open.
 
 ### 3. Operational follow-ups
 

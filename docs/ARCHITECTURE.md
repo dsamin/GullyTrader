@@ -46,15 +46,17 @@ Deep reference for how GullyTrader's pieces fit together. For "what's done / wha
                             ┌──────────▼─────────┐
                             │  SQLite (WAL)      │
                             │                    │
-                            │  markets           │
-                            │  positions         │
+                            │  positions ◀───────┼─── sync_service writes peak_pnl_cents
+                            │                    │     (Phase 5; trailing-stop reads it)
                             │  orders / fills    │
                             │  settlements       │
                             │  agent_logs ◀──────┼─── llm.py writes here on every LLM call
-                            │  exit_decisions    │     + orchestrator writes decision/exit rows
+                            │                    │     + orchestrator writes decision/exit rows
                             │  cricket_matches   │
                             │  bot_state         │
                             └────────────────────┘
+                            (Phase 5: dropped dead `markets` and
+                             `exit_decisions` tables — never written.)
 
         ┌───────────────────────────────────────────────────┐
         │  Sync service (3rd daemon thread, when enabled)   │
@@ -80,9 +82,9 @@ Deep reference for how GullyTrader's pieces fit together. For "what's done / wha
 | [`cricket_data.py`](../gully-engine/cricket_data.py) | `CricketFeed` protocol with `StubCricketFeed` (design figures) and `CricApiFeed` (cricketdata.org). The cricapi feed locates the IPL series_id once per process, then pulls all 70 matches from `/series_info` with a 60s in-process cache. In strict mode, get_feed() raises if provider=cricapi and no key is set; logs WARNING when provider=stub (you're on mock data). |
 | [`reconciler.py`](../gully-engine/reconciler.py) | Parses Kalshi event tickers like `KXIPLGAME-26MAY07RCBLSG` → `(2026-05-07, RCB, LSG)`. Greedy-splits the franchise concatenation against a known set (PBKS resolves before PB+KS). Maps Kalshi codes ↔ design codes (MI→MUM, CSK→CHE, etc.). Used by `/api/match/live` and `/api/fixtures` to attach a `kalshi_event_ticker` to each cricket-feed match. |
 | [`pnl.py`](../gully-engine/pnl.py) | The paired-position P&L correction (load-bearing — see [README#inherited-kalshi-learnings](../README.md#inherited-kalshi-learnings)). |
-| [`exit_monitor.py`](../gully-engine/exit_monitor.py) | Hard-stop matrix (stop loss / trailing / time). Returns an `ExitDecision`; LLM is only called when none of the deterministic stops fire. |
-| [`orchestrator.py`](../gully-engine/orchestrator.py) | Two daemon threads (entry + exit). Manual triggers use non-blocking locks so calls don't queue on a long-running pass. |
-| [`sync_service.py`](../gully-engine/sync_service.py) | Background reconciliation loop. `_reconcile_once()` pulls positions / orders / fills / settlements from Kalshi and upserts them into the matching SQLite tables (`UNIQUE(ticker)` for positions/settlements, `UNIQUE(kalshi_order_id)` for orders, `UNIQUE(kalshi_trade_id)` partial index for fills). Each endpoint is independently try/except'd so one Kalshi 503 can't kill the loop. Loop keep-alive logic from KalshiTrader PR #54. |
+| [`exit_monitor.py`](../gully-engine/exit_monitor.py) | Hard-stop matrix (stop loss / trailing / time). Returns an `ExitDecision`; LLM is only called when none of the deterministic stops fire. Trailing-stop and time-stop both depend on real per-position state (`peak_pnl_cents` and `opened_at`) — Phase 5 wired these from DB instead of hardcoded placeholders. |
+| [`orchestrator.py`](../gully-engine/orchestrator.py) | Two daemon threads (entry + exit). Manual triggers use non-blocking locks so calls don't queue on a long-running pass. Exit pipeline reads `opened_at` and `peak_pnl_cents` from `positions` once per tick to build `PositionSnapshot` (Phase 5). |
+| [`sync_service.py`](../gully-engine/sync_service.py) | Background reconciliation loop. `_reconcile_once()` pulls positions / orders / fills / settlements from Kalshi and upserts them into the matching SQLite tables (`UNIQUE(ticker)` for positions/settlements, `UNIQUE(kalshi_order_id)` for orders, `UNIQUE(kalshi_trade_id)` partial index for fills). Skips writing flat positions (yes_count + no_count == 0) so they don't accumulate as ghost rows. Computes per-tick unrealized P&L and updates `peak_pnl_cents` via SQL `MAX()` so peak only ever rises (Phase 5). Each endpoint is independently try/except'd so one Kalshi 503 can't kill the loop. Loop keep-alive logic from KalshiTrader PR #54. |
 | [`llm.py`](../gully-engine/llm.py) | OpenRouter chat-completions client with JSON mode. Persists every call to `agent_logs` (audit trail). Failures return `None` rather than raising so the caller decides on fallback. |
 | [`agents/scanner.py`](../gully-engine/agents/scanner.py) | Implemented. Prompts qwen-2.5-72b to rank open IPL markets by edge. Drops scores < 30, drops hallucinated tickers, falls back to first-N when LLM is unreachable. |
 | [`agents/researcher.py`](../gully-engine/agents/researcher.py) | Implemented (Phase 3). Calls `settings.research_model` via OpenRouter to estimate true YES probability for one market. Returns `ResearchNote{estimated_yes_probability, confidence, reasoning}`. Probability clamped to `[0,1]`. Fallback on LLM failure → `confidence=0` (load-bearing: makes Decision skip). |
