@@ -498,3 +498,31 @@ def test_upsert_position_negative_unrealized_keeps_peak_at_zero(tmp_db):
     finally:
         conn.close()
     assert peak == 0, f"peak should clamp to 0 for negative unrealized, got {peak}"
+
+
+def test_upsert_position_paired_skips_peak_tracking(tmp_db):
+    """Paired positions (both yes_count > 0 AND no_count > 0) skip peak tracking.
+
+    avg_cost_cents is a blended weighted average across both legs, so the
+    naive directional formula (max(yes,no) * avg_cost) understates cost basis.
+    Trailing-stop also doesn't apply to hedged positions. Peak stays at 0.
+    """
+    import sqlite3
+
+    paired = KalshiPosition(
+        ticker="KXIPL-HEDGED",
+        yes_count=10, no_count=5,
+        avg_cost_cents=30, market_exposure_cents=400,
+    )
+    conn = sqlite3.connect(str(tmp_db), isolation_level=None)
+    try:
+        sync_service._upsert_position(conn, paired)
+        row = conn.execute(
+            "SELECT peak_pnl_cents, unrealized_pnl_cents, side FROM positions "
+            "WHERE ticker = 'KXIPL-HEDGED'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row[0] == 0, f"paired peak must be 0, got {row[0]}"
+    assert row[1] == 0, f"paired unrealized must be 0, got {row[1]}"
+    assert row[2] == "yes", f"paired side should collapse to 'yes', got {row[2]}"
