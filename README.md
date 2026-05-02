@@ -12,12 +12,15 @@ Autonomous IPL prediction-market trader for Kalshi. Multi-agent LLM pipeline pic
 |---|---|
 | Frontend (8 screens, mobile-first React) | ✅ rendering against live data |
 | Kalshi RSA-PSS auth (prod) | ✅ verified — balance + 18 IPL events surface |
+| Kalshi orders / fills / settlements ingest | ✅ real client methods + sync-service reconciliation |
+| Portfolio metrics (day P&L, ROI, win rate, sparkline) | ✅ DB-derived from real settlements |
+| Real mark prices on open positions | ✅ via `KalshiClient.get_market(ticker)` |
+| `/api/trades` (executed-fills history) | ✅ wired |
 | CricAPI integration (live + fixtures + standings) | ✅ wired with 60s in-process cache |
 | Kalshi ↔ CricAPI reconciler (event-ticker parsing) | ✅ 8/10 fixtures correlate to Kalshi events |
 | Scanner agent (LLM-ranked market candidates) | ✅ ~16s round-trip, real grounded reasoning |
 | Researcher / Decision / Exit agents | ⏳ stubs — see [docs/HANDOFF.md](docs/HANDOFF.md) |
-| Sync service | ⏳ scaffold only — no real reconciliation logic yet |
-| Tests | ✅ 61 passing |
+| Tests | ✅ 94 passing |
 
 ## Stack
 
@@ -38,7 +41,8 @@ Autonomous IPL prediction-market trader for Kalshi. Multi-agent LLM pipeline pic
 │   └─ Exit monitor   ── always-on; hard stops bypass LLM        │
 │                       shadow logs decisions, live places sells │
 │                                                                │
-│  Sync service ── reconciles orders / fills / settlements       │
+│  Sync service ── pulls orders / fills / settlements / positions│
+│                  from Kalshi, upserts into SQLite (60s default)│
 │                                                                │
 │  Cricket feed (CricAPI) ── live match + fixtures + standings   │
 │  Reconciler ── parses KXIPLGAME tickers, pairs Kalshi↔CricAPI  │
@@ -154,6 +158,7 @@ GullyTrader/
 │   ├── kalshi_client.py            # Kalshi API client (signed v2)
 │   ├── cricket_data.py             # CricAPI + stub feeds
 │   ├── reconciler.py               # Kalshi event ↔ CricAPI fixture matcher
+│   ├── portfolio.py                # DB-derived metrics (day P&L, ROI, …)
 │   ├── llm.py                      # OpenRouter client + agent_logs writer
 │   ├── pnl.py                      # Paired-position P&L correction
 │   ├── exit_monitor.py             # Hard-stop + LLM exit decisions

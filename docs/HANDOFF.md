@@ -8,12 +8,17 @@ Last verified: **2026-05-01**.
 
 Verified working end-to-end against live services:
 
-- **Kalshi auth (prod):** RSA-PSS-SHA256 signing works; `/api/portfolio` returns real balance + portfolio_value; 18 IPL events surface from `/api/events/ipl`.
+- **Kalshi auth (prod):** RSA-PSS-SHA256 signing works; balance + portfolio_value real; 18 IPL events surface from `/api/events/ipl`.
+- **Kalshi reconciliation (Phase 1, 2026-05-01):** `KalshiClient.list_orders`, `list_fills`, `list_settlements` are real. Smoke run upserted **138 orders, 180 fills, 47 settlements, 28 positions** in a single pass — idempotent across re-runs. Settlements apply the paired-position P&L correction inline; matching open positions flip to `status='closed'` automatically.
+- **`/api/portfolio` derives from DB**, not hardcoded. day_pnl / ROI / win_rate / streak / spark_20d come from `portfolio.compute_metrics()` reading the `settlements` + `positions` tables. Empty DB → all-zero response, no crashes.
+- **`/api/positions` uses real mark prices** via `KalshiClient.get_market(ticker)`. Synthetic `+10 if MUM else -8` fudge is gone. Settled tab pulls from the `settlements` table, not `_mock_settled()`.
+- **`/api/trades`:** new endpoint returning the most recent fills from the local `fills` table.
+- **Frontend "Arjun" → "Devan"** (avatar default initials too).
 - **CricAPI (live):** real IPL fixtures, standings, and (when matches are in-progress) live ball-by-ball state. 60s in-process cache keeps free-tier hit count < 100/day.
 - **Reconciler:** 8 of 10 CricAPI fixtures correctly correlate to a Kalshi `KXIPLGAME` event. The 2 misses are real-world correctness, not bugs (Kalshi removes events from the open filter once they're imminent or past).
 - **Scanner agent:** prompts qwen-2.5-72b via OpenRouter, returns ranked candidates with grounded reasoning ("SRH have a strong recent form, undervalued at 50¢"). ~16s round-trip. Persists to `agent_logs`.
 - **Frontend:** all 8 screens render against live data. Hash-router navigation. Light + dark mode.
-- **Tests:** 61 passing (P&L correction, cricket feed, scanner, reconciler).
+- **Tests:** **94 passing** (P&L correction, cricket feed, scanner, reconciler, kalshi client orders/fills/settlements, sync service reconciliation, portfolio metrics, API integration).
 
 ## Next-up — ranked
 
@@ -67,21 +72,7 @@ Verified working end-to-end against live services:
 
 **Critical:** must run in shadow mode for at least one full IPL match before flipping to live. The first session is read-only validation.
 
-### 4. Sync service real reconciliation
-
-**Why:** [`sync_service._reconcile_once()`](../gully-engine/sync_service.py) is currently a `log.debug` stub. The real implementation should pull orders / fills / settlements from Kalshi and upsert into the local DB so the dashboard's "Positions" tab and exit monitor have accurate state.
-
-**Estimated effort:** ~1 hour.
-
-**Concrete steps:**
-1. `KalshiClient.list_orders()` (add the method — pattern's the same as `list_positions`)
-2. `KalshiClient.list_settlements()` similarly
-3. `_reconcile_once()`: pull positions/orders/settlements/balance, upsert into the corresponding tables, write last-sync timestamp somewhere
-4. Test with mocked KalshiClient that returns synthetic data
-
-**Acceptance:** `GULLYTRADER_ENABLE_ORCHESTRATOR=1` for 5 minutes; SQLite tables show recent sync timestamps; dashboard shows real-time-ish positions.
-
-### 5. Operational follow-ups
+### 4. Operational follow-ups
 
 These don't block the agents but make the engine production-ready:
 
@@ -91,14 +82,14 @@ These don't block the agents but make the engine production-ready:
 - [ ] Backfill test coverage toward 170+ (KalshiTrader's bench). Priority adds: orchestrator manual-trigger lock semantics, sync_service keep-alive, exit_monitor hard-stop matrix, kalshi_client RSA signing format
 - [ ] Add Playwright visual regression for the 8 screens
 
-### 6. UX polish
+### 5. UX polish
 
 - [ ] Confetti animation when a winning settlement lands (CSS already in `styles.css`, just needs trigger)
 - [ ] Pull-to-refresh on Home + Match Centre
 - [ ] Long-press on position cards for quick close / set alert
 - [ ] Reduced-motion media query support (the rules are in styles.css, just verify)
 
-### 7. Deploy
+### 6. Deploy
 
 Not urgent for a hobby project, but when ready:
 

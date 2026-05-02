@@ -100,7 +100,7 @@ const TabBar = ({ active = "home", onSelect }) => {
   );
 };
 
-const Avatar = ({ initials = "AR", color = "#FF8533" }) => (
+const Avatar = ({ initials = "DE", color = "#FF8533" }) => (
   <div style={{
     width: 36, height: 36, borderRadius: 99,
     background: `linear-gradient(135deg, ${color}, #2E4FFF)`,

@@ -30,6 +30,7 @@ from pydantic import BaseModel
 
 import database
 import orchestrator
+import portfolio
 import sync_service
 from cricket_data import get_feed
 from kalshi_client import KalshiClient
@@ -91,18 +92,11 @@ async def root() -> FileResponse:
 async def get_portfolio() -> dict:
     client = KalshiClient()
     bal = client.get_balance()
+    metrics = portfolio.compute_metrics()
     return {
         "balance_cents": bal.get("balance", 0),
         "portfolio_value_cents": bal.get("portfolio_value", 0),
-        "day_pnl_pct": 8.42,
-        "day_pnl_abs_cents": 332_74,
-        "roi_pct": 32.4,
-        "win_rate_pct": 68,
-        "wagered_cents": 1_940_00,
-        "open_positions": 12,
-        "exposure_cents": 940_00,
-        "streak_last_10": ["W", "W", "L", "W", "W", "W", "W", "L", "W", "W"],
-        "spark_20d": [42, 41, 43, 47, 45, 49, 53, 51, 55, 58, 56, 62, 60, 67, 71, 69, 74, 80, 86, 92],
+        **metrics,
     }
 
 
@@ -114,27 +108,51 @@ async def list_positions() -> dict:
     for p in raw:
         side = normalize_position_side(p.yes_count, p.no_count)
         contracts = position_contract_count(p.yes_count, p.no_count)
-        # Synthetic mark for the stub — real path: fetch market price
-        synthetic_mark = max(1, min(99, p.avg_cost_cents + (10 if "MUM" in p.ticker else -8)))
-        pnl = (synthetic_mark - p.avg_cost_cents) * contracts
+        effective_side = side if side != "paired" else "yes"
+
+        # Real mark price from Kalshi. If the market isn't returnable
+        # (delisted, transient API miss), fall back to entry price → 0 P&L.
+        market = None
+        try:
+            market = client.get_market(p.ticker)
+        except Exception:
+            log.exception("api.positions: get_market failed for %s", p.ticker)
+        if market is not None:
+            mark = market.yes_price if effective_side == "yes" else market.no_price
+        else:
+            mark = p.avg_cost_cents
+        pnl = (mark - p.avg_cost_cents) * contracts
+
         open_positions.append(
             {
                 "ticker": p.ticker,
-                "title": _stub_title(p.ticker),
-                "match": _stub_match(p.ticker),
-                "side": side if side != "paired" else "yes",
+                "title": (market.title if market else p.ticker),
+                "match": _match_label(p.ticker),
+                "side": effective_side,
                 "entry_cents": p.avg_cost_cents,
-                "mark_cents": synthetic_mark,
+                "mark_cents": mark,
                 "contracts": contracts,
                 "pnl_cents": pnl,
                 "exit_chip": "TP near" if pnl > 1500 else ("SL hit" if pnl < -300 else "Hold"),
             }
         )
+
+    settled = portfolio.recent_settled_positions()
+    active_cents = sum(p["entry_cents"] * p["contracts"] for p in open_positions)
     return {
         "open": open_positions,
-        "settled": _mock_settled(),
-        "totals": {"active_dollars": 2847.0, "today_pnl_cents": 23_30},
+        "settled": settled,
+        "totals": {
+            "active_dollars": round(active_cents / 100.0, 2),
+            "today_pnl_cents": portfolio.compute_metrics()["day_pnl_abs_cents"],
+        },
     }
+
+
+@app.get("/api/trades")
+async def list_trades(limit: int = 50) -> dict:
+    """Recent fills (executions) — populated by sync_service from Kalshi."""
+    return {"trades": portfolio.recent_fills(limit=limit)}
 
 
 @app.get("/api/match/live")
@@ -316,31 +334,20 @@ async def trigger_exit() -> dict:
 # ── helpers ────────────────────────────────────────────────────────────
 
 
-_TITLES = {
-    "KXIPL-26-MUMCHE-MUM":  "Mumbai Marauders win vs Chennai",
-    "KXIPL-26-MUMCHE-OVER": "Total runs over 178.5",
-    "KXIPL-26-BLRKOL-KOH":  "Bolts top batter: V. Kohli",
-    "KXIPL-26-BLRKOL-PP":   "BLR Powerplay > 52.5",
-}
-_MATCHES = {
-    "KXIPL-26-MUMCHE-MUM":  "MUM·CHE",
-    "KXIPL-26-MUMCHE-OVER": "MUM·CHE",
-    "KXIPL-26-BLRKOL-KOH":  "BLR·KOL",
-    "KXIPL-26-BLRKOL-PP":   "BLR·KOL",
-}
+def _match_label(ticker: str) -> str:
+    """Best-effort match label parsed from a Kalshi ticker.
 
-
-def _stub_title(ticker: str) -> str:
-    return _TITLES.get(ticker, ticker)
-
-
-def _stub_match(ticker: str) -> str:
-    return _MATCHES.get(ticker, "—")
-
-
-def _mock_settled() -> list[dict]:
-    return [
-        {"title": "CHE win vs PUN",        "entry_cents": 51, "exit_cents": 100, "contracts": 100, "pnl_cents": 49_00,  "win": True,  "reason": "Settled YES"},
-        {"title": "Total runs > 162.5",    "entry_cents": 60, "exit_cents":   0, "contracts":  80, "pnl_cents": -48_00, "win": False, "reason": "Settled NO"},
-        {"title": "KKR top batter SR",     "entry_cents": 45, "exit_cents":  78, "contracts":  50, "pnl_cents": 16_50,  "win": True,  "reason": "Manual close"},
-    ]
+    Real IPL match tickers look like `KXIPLGAME-26MAY07RCBLSG-LSG` — the
+    middle segment encodes both teams. We extract them when possible; fall
+    back to the raw ticker otherwise.
+    """
+    parts = ticker.split("-")
+    if len(parts) >= 2 and len(parts[1]) >= 6:
+        # date prefix like "26MAY07" then 6 alphabetic team chars
+        seg = parts[1]
+        # find the index where the alphabetic team-pair starts
+        for i in range(len(seg) - 5):
+            if seg[i:i + 6].isalpha():
+                team_a, team_b = seg[i:i + 3], seg[i + 3:i + 6]
+                return f"{team_a}·{team_b}"
+    return "—"
