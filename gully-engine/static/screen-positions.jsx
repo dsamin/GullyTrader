@@ -25,14 +25,18 @@ const Positions = ({ data }) => {
       </div>
 
       <div className="row" style={{ gap: 6, marginBottom: 12, overflowX: 'auto' }}>
-        {['All matches', 'MUM·CHE', 'BLR·KOL', 'This week'].map((f, i) => (
-          <span key={f} className="chip" style={{
-            background: i === 0 ? 'var(--saffron)' : 'var(--raised)',
-            color: i === 0 ? '#0A0E1A' : 'var(--text)',
-            borderColor: i === 0 ? 'var(--saffron)' : 'var(--hairline)',
-            flexShrink: 0
-          }}>{f}</span>
-        ))}
+        {(() => {
+          const matches = Array.from(new Set(open.map(p => p.match).filter(m => m && m !== '—')));
+          const filters = ['All matches', ...matches, 'This week'];
+          return filters.map((f, i) => (
+            <span key={f} className="chip" style={{
+              background: i === 0 ? 'var(--saffron)' : 'var(--raised)',
+              color: i === 0 ? '#0A0E1A' : 'var(--text)',
+              borderColor: i === 0 ? 'var(--saffron)' : 'var(--hairline)',
+              flexShrink: 0
+            }}>{f}</span>
+          ));
+        })()}
       </div>
 
       {open.map((p, i) => (

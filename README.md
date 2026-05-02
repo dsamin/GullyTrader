@@ -23,7 +23,10 @@ Autonomous IPL prediction-market trader for Kalshi. Multi-agent LLM pipeline pic
 | Decision agent (Quarter-Kelly sizer, pure math) | ✅ wired (Phase 3) — gated by `GULLYTRADER_DECISION_MODE` |
 | PortfolioExit agent (LLM hold/sell on open positions) | ✅ wired (Phase 3) — gated by `GULLYTRADER_EXIT_MODE` |
 | Strict-mode auth gating (prod-default; raises on missing creds) | ✅ live |
-| Tests | ✅ 129 passing |
+| Bot toggle + status (real, persisted) | ✅ live (Phase 4) |
+| Tests | ✅ 145 passing |
+
+**Phase 4 cleanup (2026-05-01):** Real bot status pill (reads recent decisions from `agent_logs`), real bot toggle (persists to `bot_state`, starts/stops orchestrator threads idempotently), `cricket_matches` table populated each sync pass, `closed_market_cache` orphan removed, position filter pills derive from open positions, `purge_old_agent_logs` runs daily from sync loop in addition to the lifespan startup.
 
 ## Stack
 
@@ -175,7 +178,7 @@ These are the things you will get wrong if you reinvent them. They're documented
 5. **Sync loop must keep alive.** Wrap DB writes in try/finally, swallow transient SQLite errors. See [`sync_service.py`](gully-engine/sync_service.py).
 6. **WAL mode + agent_logs TTL.** SQLite WAL for concurrency, log rotation (default 7 days). See [`database.py`](gully-engine/database.py).
 7. **Filter parlay/multi-game spam.** Drop `KXMVECROSSCATEGORY*` and `KXMVESPORTSMULTIGAME*`. See [`kalshi_client.py`](gully-engine/kalshi_client.py).
-8. **Restart resilience.** Persist closed-market cache + startup grace window so the exit monitor doesn't re-log noise.
+8. **Restart resilience.** Persist a current-state snapshot (the `cricket_matches` table is upserted each sync pass) + startup grace window so the exit monitor doesn't re-log noise.
 
 ## Project structure
 
@@ -208,7 +211,7 @@ GullyTrader/
 │   │   ├── decision.py             # Quarter-Kelly sizer, pure math (Phase 3)
 │   │   └── portfolio_exit.py       # LLM hold/sell, safety-default hold (Phase 3)
 │   ├── static/                     # 8-screen React UI (no build step)
-│   ├── tests/                      # 61 tests
+│   ├── tests/                      # 145 tests
 │   └── requirements.txt
 └── tasks/
     └── todo.md

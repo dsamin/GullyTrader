@@ -10,8 +10,7 @@ Carries forward two hard rules from KalshiTrader:
    `exit_decisions` but never places sells.
 
 Restart resilience is baked in: a startup grace window prevents the monitor
-from re-logging stale decisions on every reboot, and the closed_market_cache
-table stops it from rechecking already-settled markets after a restart.
+from re-logging stale decisions on every reboot.
 """
 
 from __future__ import annotations

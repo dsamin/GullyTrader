@@ -204,3 +204,109 @@ def test_api_positions_falls_back_when_get_market_returns_none(app_client):
     pos = resp.json()["open"][0]
     assert pos["mark_cents"] == 42
     assert pos["pnl_cents"] == 0
+
+
+# ── /api/bot/status ────────────────────────────────────────────────────
+
+
+def test_api_bot_status_reflects_recent_decision_log(app_client):
+    """When agent_logs has a recent agent='decision' row, /api/bot/status
+    surfaces it as last_action / last_action_seconds_ago."""
+    import time
+    client, _ = app_client
+    now = int(time.time())
+    with database.write_conn() as conn:
+        conn.execute(
+            "INSERT INTO agent_logs (agent, ticker, decision, reasoning, created_at) "
+            "VALUES ('decision', 'KXIPL-MUM', 'buy_yes', 'edge=+7c', ?)",
+            (now - 30,),
+        )
+
+    fake = MagicMock()
+    with patch("main.KalshiClient", return_value=fake):
+        resp = client.get("/api/bot/status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["last_action"] == "buy_yes KXIPL-MUM"
+    assert 25 <= data["last_action_seconds_ago"] <= 90   # allow scheduling jitter
+
+
+def test_api_bot_status_returns_null_when_no_recent_decision(app_client):
+    """No agent_logs in the last hour -> nulls (not stale fixture data)."""
+    client, _ = app_client
+    fake = MagicMock()
+    with patch("main.KalshiClient", return_value=fake):
+        resp = client.get("/api/bot/status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["last_action"] is None
+    assert data["last_action_seconds_ago"] is None
+
+
+def test_api_bot_status_ignores_decisions_older_than_one_hour(app_client):
+    """Decisions older than 3600s should not surface in the pill."""
+    import time
+    client, _ = app_client
+    with database.write_conn() as conn:
+        conn.execute(
+            "INSERT INTO agent_logs (agent, ticker, decision, reasoning, created_at) "
+            "VALUES ('decision', 'OLD', 'buy_yes', '...', ?)",
+            (int(time.time()) - 7_200,),
+        )
+
+    fake = MagicMock()
+    with patch("main.KalshiClient", return_value=fake):
+        resp = client.get("/api/bot/status")
+    data = resp.json()
+    assert data["last_action"] is None
+    assert data["last_action_seconds_ago"] is None
+
+
+# ── /api/bot/toggle ────────────────────────────────────────────────────
+
+
+def test_api_bot_toggle_starts_orchestrator_when_active_true(app_client):
+    client, _ = app_client
+    fake = MagicMock()
+    with patch("main.KalshiClient", return_value=fake), \
+         patch("main.orchestrator.start_threads") as start_mock, \
+         patch("main.orchestrator.stop") as stop_mock, \
+         patch("main.orchestrator.is_running", return_value=False):
+        resp = client.post("/api/bot/toggle", json={"active": True})
+    assert resp.status_code == 200
+    assert resp.json()["active"] is True
+    start_mock.assert_called_once()
+    stop_mock.assert_not_called()
+    assert database.get_bot_active() is True
+
+
+def test_api_bot_toggle_stops_orchestrator_when_active_false(app_client):
+    client, _ = app_client
+    database.set_bot_active(True)   # pretend the bot was running
+    fake = MagicMock()
+    with patch("main.KalshiClient", return_value=fake), \
+         patch("main.orchestrator.start_threads") as start_mock, \
+         patch("main.orchestrator.stop") as stop_mock, \
+         patch("main.orchestrator.is_running", return_value=True):
+        resp = client.post("/api/bot/toggle", json={"active": False})
+    assert resp.status_code == 200
+    assert resp.json()["active"] is False
+    stop_mock.assert_called_once()
+    start_mock.assert_not_called()
+    assert database.get_bot_active() is False
+
+
+def test_api_bot_toggle_is_idempotent_on_no_state_change(app_client):
+    """Toggling to the current state should not call start/stop."""
+    client, _ = app_client
+    database.set_bot_active(True)
+    fake = MagicMock()
+    with patch("main.KalshiClient", return_value=fake), \
+         patch("main.orchestrator.start_threads") as start_mock, \
+         patch("main.orchestrator.stop") as stop_mock, \
+         patch("main.orchestrator.is_running", return_value=True):
+        resp = client.post("/api/bot/toggle", json={"active": True})
+    assert resp.status_code == 200
+    assert resp.json()["active"] is True
+    start_mock.assert_not_called()
+    stop_mock.assert_not_called()

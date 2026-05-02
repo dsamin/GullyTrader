@@ -121,11 +121,6 @@ CREATE TABLE IF NOT EXISTS exit_decisions (
     created_at INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS closed_market_cache (
-    ticker TEXT PRIMARY KEY,
-    closed_at INTEGER NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS cricket_matches (
     match_id TEXT PRIMARY KEY,
     series TEXT,
@@ -143,6 +138,12 @@ CREATE TABLE IF NOT EXISTS cricket_matches (
 );
 
 CREATE INDEX IF NOT EXISTS cricket_matches_status_idx ON cricket_matches(status);
+
+CREATE TABLE IF NOT EXISTS bot_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    active INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+);
 """
 
 
@@ -191,6 +192,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "ON fills(kalshi_trade_id) WHERE kalshi_trade_id IS NOT NULL"
     )
 
+    # Phase 4: drop orphan closed_market_cache table (never written/read).
+    try:
+        conn.execute("DROP TABLE IF EXISTS closed_market_cache")
+    except sqlite3.OperationalError:
+        pass
+
 
 @contextlib.contextmanager
 def write_conn() -> Iterator[sqlite3.Connection]:
@@ -216,3 +223,31 @@ def purge_old_agent_logs(max_age_days: int | None = None) -> int:
     with write_conn() as conn:
         cur = conn.execute("DELETE FROM agent_logs WHERE created_at < ?", (cutoff,))
         return cur.rowcount or 0
+
+
+def ensure_bot_state(default_active: bool = False) -> None:
+    """Insert the singleton bot_state row if it doesn't exist yet."""
+    import time
+    with write_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO bot_state (id, active, updated_at) "
+            "VALUES (1, ?, ?)",
+            (1 if default_active else 0, int(time.time())),
+        )
+
+
+def get_bot_active() -> bool:
+    with connect() as conn:
+        row = conn.execute("SELECT active FROM bot_state WHERE id = 1").fetchone()
+    return bool(row and row["active"])
+
+
+def set_bot_active(active: bool) -> None:
+    import time
+    with write_conn() as conn:
+        conn.execute(
+            "INSERT INTO bot_state (id, active, updated_at) VALUES (1, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET active=excluded.active, "
+            "updated_at=excluded.updated_at",
+            (1 if active else 0, int(time.time())),
+        )

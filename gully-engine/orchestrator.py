@@ -26,13 +26,41 @@ from settings import settings
 
 log = logging.getLogger(__name__)
 
+
+def _log_decision(agent: str, ticker: str, decision: str, reasoning: str) -> None:
+    """Write a single agent_logs row for a non-LLM orchestrator decision.
+
+    The LLM-driven agents (scanner, researcher, exit) self-log via llm.chat_json.
+    The pure-math Decision agent and the deterministic exit-monitor branches don't,
+    so the orchestrator emits an explicit row so /api/bot/status can read them.
+    """
+    import database  # local import — keeps module load order stable in tests
+    try:
+        with database.write_conn() as conn:
+            conn.execute(
+                "INSERT INTO agent_logs (agent, ticker, decision, reasoning, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (agent, ticker, decision, reasoning, int(time.time())),
+            )
+    except Exception:  # noqa: BLE001 — DB write failure must not crash the loop
+        log.exception("orchestrator: failed to write agent_log %s/%s", agent, ticker)
+
+
 _stop_flag = threading.Event()
 _entry_lock = threading.Lock()
 _exit_lock = threading.Lock()
+_threads: list[threading.Thread] = []
+_running = False
 
 
 def stop() -> None:
+    global _running
     _stop_flag.set()
+    _running = False
+
+
+def is_running() -> bool:
+    return _running
 
 
 # ── Entry pipeline ────────────────────────────────────────────────────
@@ -71,6 +99,12 @@ def run_entry_pipeline_once(*, force: bool = False) -> dict:
                 continue
             note = research(market, live)
             dec = decide(note, bankroll_cents=balance, market=market)
+            _log_decision(
+                agent="decision",
+                ticker=dec.ticker,
+                decision=dec.action,
+                reasoning=dec.reasoning,
+            )
             order_resp = None
             if dec.action != "pass" and settings.decision_mode == "live":
                 side = "yes" if dec.action == "buy_yes" else "no"
@@ -145,6 +179,12 @@ def run_exit_monitor_once(*, force: bool = False) -> dict:
                 peak_pnl_cents=0,       # TODO(phase-4): track peak P&L for trailing-stop
             )
             exit_dec = evaluate(snap, now=now)
+            _log_decision(
+                agent="exit",
+                ticker=exit_dec.ticker,
+                decision=exit_dec.action,
+                reasoning=f"{exit_dec.trigger}: {exit_dec.note}",
+            )
             order_resp = None
             if exit_dec.action == "sell" and settings.exit_mode == "live":
                 try:
@@ -184,10 +224,22 @@ def _exit_loop() -> None:
 # ── Lifecycle ─────────────────────────────────────────────────────────
 
 
-def start_threads() -> tuple[threading.Thread, threading.Thread]:
+def start_threads() -> tuple[threading.Thread, threading.Thread] | None:
+    """Start entry + exit loops. Idempotent — a second call while already
+    running is a no-op and returns None.
+
+    Clears `_stop_flag` so a start-after-stop cycle re-arms the loops.
+    """
+    global _running, _threads
+    if _running:
+        log.info("orchestrator: start_threads called while already running — no-op")
+        return None
+    _stop_flag.clear()
     entry_t = threading.Thread(target=_entry_loop, daemon=True, name="orch.entry")
     exit_t = threading.Thread(target=_exit_loop, daemon=True, name="orch.exit")
     entry_t.start()
     exit_t.start()
+    _threads = [entry_t, exit_t]
+    _running = True
     log.info("orchestrator: entry + exit threads started (exit_mode=%s)", settings.exit_mode)
     return entry_t, exit_t

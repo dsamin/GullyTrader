@@ -55,6 +55,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 async def lifespan(app: FastAPI):
     log.info("startup: initializing DB at %s", settings.db_path)
     database.initialize()
+    database.ensure_bot_state(default_active=settings.enable_orchestrator)
 
     # One-line, grep-friendly banner: kalshi=authed/unauthed cricket=stub/cricapi strict=on/off env=demo/prod
     try:
@@ -75,11 +76,11 @@ async def lifespan(app: FastAPI):
     purged = database.purge_old_agent_logs()
     log.info("startup: purged %d old agent_logs rows", purged)
 
-    if settings.enable_orchestrator:
+    if database.get_bot_active():
         sync_service.start_in_thread()
         orchestrator.start_threads()
     else:
-        log.info("startup: orchestrator disabled (GULLYTRADER_ENABLE_ORCHESTRATOR=0)")
+        log.info("startup: bot toggled off (bot_state.active=0); orchestrator not started")
 
     yield
 
@@ -298,11 +299,35 @@ async def get_standings() -> dict:
 
 @app.get("/api/bot/status")
 async def get_bot_status() -> dict:
+    """Bot status pill — last decision/exit + current toggle state.
+
+    Reads the most recent `agent_logs` row where agent IN ('decision','exit')
+    within the last hour. Older or missing -> null fields (so the UI clearly
+    shows an idle bot, not stale fixture data).
+    """
+    import time as _time
+    now_ts = int(_time.time())
+    cutoff = now_ts - 3600
+    with database.connect() as conn:
+        row = conn.execute(
+            "SELECT agent, ticker, decision, created_at FROM agent_logs "
+            "WHERE agent IN ('decision','exit') AND created_at > ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (cutoff,),
+        ).fetchone()
+
+    if row is None:
+        last_action = None
+        last_action_seconds_ago = None
+    else:
+        last_action = f"{row['decision']} {row['ticker']}"
+        last_action_seconds_ago = max(0, now_ts - int(row["created_at"]))
+
     return {
-        "active": settings.enable_orchestrator,
+        "active": database.get_bot_active(),
         "mode": settings.exit_mode,
-        "last_action": "bought MUM YES @ 58¢",
-        "last_action_seconds_ago": 120,
+        "last_action": last_action,
+        "last_action_seconds_ago": last_action_seconds_ago,
         "scanner_model": settings.scanner_model,
         "decision_model": settings.decision_model,
         "exit_model": settings.exit_model,
@@ -315,8 +340,23 @@ class BotToggleBody(BaseModel):
 
 @app.post("/api/bot/toggle")
 async def toggle_bot(body: BotToggleBody) -> dict:
-    # In a real impl this would flip an env-backed flag, restart threads, etc.
-    return {"active": body.active, "note": "stub — threads not actually toggled"}
+    """Persist the bot toggle to bot_state and start/stop orchestrator threads.
+
+    Idempotent on no-state-change (avoids double-start). Toggling to the
+    same state is a no-op except for the updated_at timestamp.
+    """
+    target = bool(body.active)
+    currently_running = orchestrator.is_running()
+
+    if target and not currently_running:
+        orchestrator.start_threads()
+        log.info("api.bot/toggle: started orchestrator threads")
+    elif not target and currently_running:
+        orchestrator.stop()
+        log.info("api.bot/toggle: stopped orchestrator threads")
+
+    database.set_bot_active(target)
+    return {"active": target}
 
 
 class OrderBody(BaseModel):

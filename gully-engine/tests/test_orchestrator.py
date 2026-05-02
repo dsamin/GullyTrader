@@ -8,11 +8,28 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+import database
 import orchestrator
 from agents.decision import TradeDecision
 from agents.researcher import ResearchNote
 from exit_monitor import ExitDecision
 from kalshi_client import KalshiMarket, KalshiPosition
+
+
+@pytest.fixture
+def tmp_db(tmp_path):
+    """Point settings.db_path at a tmp file and run schema."""
+    from settings import settings as _settings
+    db_path = tmp_path / "test.db"
+    original = _settings.db_path
+    object.__setattr__(_settings, "db_path", db_path)
+    try:
+        database.initialize(db_path)
+        yield db_path
+    finally:
+        object.__setattr__(_settings, "db_path", original)
 
 
 def _set_settings(**overrides):
@@ -209,3 +226,130 @@ def test_exit_pipeline_fetches_real_mark_via_get_market():
         client.get_market.assert_called_once_with("KXIPLGAME-T")
     finally:
         restore()
+
+
+def test_run_entry_pipeline_writes_decision_to_agent_logs(tmp_db):
+    """Each candidate's decision must land in agent_logs as agent='decision'."""
+    market = _market("KXIPLGAME-26-MUM", yes=58)
+    fake_client = type("C", (), {})()
+    fake_client.list_ipl_markets = lambda: [market]
+    fake_client.get_balance = lambda: {"balance": 100_00}
+    fake_client.place_limit_order = lambda **kw: {"order_id": "o1"}
+
+    note = ResearchNote(
+        ticker=market.ticker, estimated_yes_probability=0.65,
+        confidence=0.8, reasoning="strong form",
+    )
+    decision = TradeDecision(
+        ticker=market.ticker, action="buy_yes", contracts=10,
+        limit_price_cents=59, reasoning="edge=+7c kelly=0.20 -> 10 ct",
+    )
+
+    candidate = type("C", (), {"ticker": market.ticker, "score": 9, "reason": "x"})()
+
+    with patch("orchestrator.KalshiClient", return_value=fake_client), \
+         patch("orchestrator.scanner_shortlist", return_value=[candidate]), \
+         patch("orchestrator.research", return_value=note), \
+         patch("orchestrator.decide", return_value=decision), \
+         patch("orchestrator.get_feed") as gf:
+        gf.return_value.live_match = lambda: None
+        orchestrator.run_entry_pipeline_once(force=True)
+
+    with database.connect(tmp_db) as conn:
+        rows = conn.execute(
+            "SELECT agent, ticker, decision, reasoning FROM agent_logs WHERE agent='decision'"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["ticker"] == market.ticker
+    assert rows[0]["decision"] == "buy_yes"
+    assert "edge=+7c" in rows[0]["reasoning"]
+
+
+def test_run_exit_monitor_writes_exit_to_agent_logs(tmp_db):
+    """Each evaluated position must land an agent_logs row keyed agent='exit'."""
+    import database
+    pos = _position("KXIPL-T", side="yes")
+    market = _market(pos.ticker, yes=58)
+    exit_dec = ExitDecision(
+        ticker=pos.ticker, trigger="llm", action="hold", mode="shadow",
+        mark_price_cents=58, pnl_cents_at_decision=800, note="hold: still positive momentum",
+    )
+    fake_client = type("C", (), {})()
+    fake_client.list_positions = lambda: [pos]
+    fake_client.get_market = lambda t: market
+    fake_client.place_limit_order = lambda **kw: {}
+
+    with patch("orchestrator.KalshiClient", return_value=fake_client), \
+         patch("orchestrator.evaluate", return_value=exit_dec):
+        orchestrator.run_exit_monitor_once(force=True)
+
+    with database.connect(tmp_db) as conn:
+        rows = conn.execute(
+            "SELECT agent, ticker, decision, reasoning FROM agent_logs WHERE agent='exit'"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["ticker"] == pos.ticker
+    assert rows[0]["decision"] == "hold"
+    assert "llm" in rows[0]["reasoning"]
+
+
+@pytest.fixture
+def _stub_orchestrator_loops():
+    """Replace orchestrator's _entry_loop / _exit_loop with no-op waiters.
+
+    The lifecycle tests below care about thread-state semantics (start/stop/
+    is_running), not about what the loops do. Stubbing them prevents real
+    Kalshi/CricAPI calls and DB writes during these tests, and makes the
+    threads exit promptly when _stop_flag is set.
+    """
+    import orchestrator
+    orig_entry = orchestrator._entry_loop
+    orig_exit = orchestrator._exit_loop
+
+    def _waiter():
+        orchestrator._stop_flag.wait()
+
+    orchestrator._entry_loop = _waiter
+    orchestrator._exit_loop = _waiter
+    yield
+    orchestrator._entry_loop = orig_entry
+    orchestrator._exit_loop = orig_exit
+
+
+def test_orchestrator_start_threads_clears_stop_flag(tmp_db, _stub_orchestrator_loops):
+    """A start_threads() call after stop() must clear _stop_flag so the new
+    threads don't see is_set() and immediately bail."""
+    import orchestrator
+    orchestrator.stop()
+    assert orchestrator._stop_flag.is_set()
+    try:
+        orchestrator.start_threads()
+        assert not orchestrator._stop_flag.is_set()
+    finally:
+        orchestrator.stop()
+
+
+def test_orchestrator_start_threads_is_idempotent(tmp_db, _stub_orchestrator_loops):
+    """Calling start_threads twice must not spawn two pairs of loops."""
+    import orchestrator
+    try:
+        orchestrator.start_threads()
+        threads_after_first = list(orchestrator._threads)
+        result = orchestrator.start_threads()    # second call is a no-op
+        assert result is None
+        assert orchestrator._threads == threads_after_first   # same Thread objects
+        assert orchestrator.is_running() is True
+    finally:
+        orchestrator.stop()
+
+
+def test_orchestrator_is_running_reflects_state(tmp_db, _stub_orchestrator_loops):
+    import orchestrator
+    orchestrator.stop()
+    assert orchestrator.is_running() is False
+    try:
+        orchestrator.start_threads()
+        assert orchestrator.is_running() is True
+    finally:
+        orchestrator.stop()
+        assert orchestrator.is_running() is False

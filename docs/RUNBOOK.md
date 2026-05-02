@@ -88,6 +88,39 @@ sqlite3 gullytrader.db "
   ORDER BY created_at DESC LIMIT 20"
 ```
 
+## Bot toggle
+
+### Toggle the bot on/off
+
+From the dashboard, click the bot pill. The toggle persists to `bot_state.active` and idempotently starts or stops the orchestrator entry/exit threads. Restarts respect the persisted toggle, not the env var.
+
+**Known limitation:** the toggle does NOT stop `sync_service` (the Kalshi reconciliation poll). When the bot is "off," sync continues polling positions/orders/fills/settlements every 60s. This is wasteful but harmless — sync doesn't place orders. A future Phase 5 task will wire sync_service into the toggle for true symmetry.
+
+**Manual override:**
+
+```bash
+sqlite3 gullytrader.db "UPDATE bot_state SET active=1, updated_at=strftime('%s','now') WHERE id=1"
+```
+
+**Force re-seed from env on next boot:**
+
+```bash
+sqlite3 gullytrader.db "DELETE FROM bot_state"
+# next process restart will re-init from GULLYTRADER_ENABLE_ORCHESTRATOR
+```
+
+### What's the bot been doing?
+
+```bash
+sqlite3 gullytrader.db "SELECT datetime(created_at,'unixepoch'), agent, ticker, decision, substr(reasoning,1,80) FROM agent_logs WHERE agent IN ('decision','exit') ORDER BY created_at DESC LIMIT 20"
+```
+
+The `agent='exit'` rows have a trigger prefix in `reasoning` (`stop_loss: ...`, `trailing_stop: ...`, `time: ...`, `llm: ...`). To filter by trigger:
+
+```bash
+sqlite3 gullytrader.db "SELECT datetime(created_at,'unixepoch'), ticker, reasoning FROM agent_logs WHERE agent='exit' AND reasoning LIKE 'stop_loss:%' ORDER BY created_at DESC"
+```
+
 ## Probing live services without booting the server
 
 Useful when investigating an API issue without restarting uvicorn.

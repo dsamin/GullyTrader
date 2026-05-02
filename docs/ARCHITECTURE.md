@@ -51,9 +51,9 @@ Deep reference for how GullyTrader's pieces fit together. For "what's done / wha
                             │  orders / fills    │
                             │  settlements       │
                             │  agent_logs ◀──────┼─── llm.py writes here on every LLM call
-                            │  exit_decisions    │
-                            │  closed_market_cache
+                            │  exit_decisions    │     + orchestrator writes decision/exit rows
                             │  cricket_matches   │
+                            │  bot_state         │
                             └────────────────────┘
 
         ┌───────────────────────────────────────────────────┐
@@ -89,6 +89,30 @@ Deep reference for how GullyTrader's pieces fit together. For "what's done / wha
 | [`agents/decision.py`](../gully-engine/agents/decision.py) | Implemented (Phase 3). Pure-math Quarter-Kelly sizing on `ResearchNote` (no LLM call — the LLM signal lives in the note). Returns `TradeDecision{action, contracts, limit_price_cents, reasoning}`. `pass` if edge<5¢, confidence=0, or contracts<1. Limit price = best-bid + 1¢, clamped `[1, 99]`. Sizing uses limit price (not bid) so the 5%-of-bankroll cap holds at execution. |
 | [`agents/portfolio_exit.py`](../gully-engine/agents/portfolio_exit.py) | Implemented (Phase 3). LLM hold/sell on a single open position. Defaults to HOLD on any failure (LLM unavailable, malformed JSON, invalid action) — never accidentally sells on a bad LLM response. |
 
+## Notable tables
+
+The full schema lives in [`database.py`](../gully-engine/database.py). Two non-obvious tables worth calling out:
+
+- **`bot_state`** — singleton row (CHECK `id = 1`). Holds `active` (int 0/1) and `updated_at`. Seeded by `database.ensure_bot_state(default_active=...)` from `GULLYTRADER_ENABLE_ORCHESTRATOR` on first lifespan boot. Mutated by `/api/bot/toggle`. Source of truth for whether the orchestrator threads are started at boot.
+
+- **`cricket_matches`** — current live-match snapshot, written by `sync_service._upsert_cricket_match` each pass. Single row per `match_id`, upsert-on-conflict. Status `'live'` when populated. The dashboard's `/api/match/live` endpoint still reads through `CricApiFeed`'s 60s in-memory cache — `cricket_matches` is for restart resilience and historical lookback.
+
+### `agent_logs` row taxonomy
+
+Every row carries `agent`, `ticker`, `decision`, `reasoning`, `created_at`. LLM-driven agents also populate `model`, `latency_ms`, `confidence`.
+
+| agent | written by | trigger |
+|-------|------------|---------|
+| `scanner` | `llm.chat_json` (auto) | each LLM scan call |
+| `researcher` | `llm.chat_json` (auto) | each LLM research call |
+| `portfolio_exit` | `llm.chat_json` (auto) | LLM-driven exit branch only |
+| `decision` | `orchestrator.run_entry_pipeline_once` (explicit) | each `decide()` result |
+| `exit` | `orchestrator.run_exit_monitor_once` (explicit) | each `evaluate()` result |
+
+The `agent='exit'` `reasoning` column carries the trigger prefix (`stop_loss:`, `trailing_stop:`, `time:`, `llm:`, `manual:`) so a single sqlite `LIKE 'stop_loss:%'` query buckets exits by cause.
+
+An LLM-driven exit produces TWO rows per evaluation — one `portfolio_exit` (from `llm.chat_json`, with model/latency/full reasoning) and one `exit` (from the orchestrator, with structured `{trigger}: {note}`). Complementary, not duplicate.
+
 ## Key data flows
 
 ### 1. Dashboard load (read-only)
@@ -110,7 +134,8 @@ browser GET /
         ├─ /api/fixtures     → CricApiFeed.upcoming_fixtures()
         │                      + reconciler.kalshi_event_for_fixture() per row
         ├─ /api/standings    → CricApiFeed.standings()
-        └─ /api/bot/status   → settings (no I/O)
+        └─ /api/bot/status   → bot_state.active + most recent agent_logs row
+                                  WHERE agent IN ('decision','exit') AND created_at > now-3600
 ```
 
 ### 1b. Background reconciliation (when orchestrator enabled)
