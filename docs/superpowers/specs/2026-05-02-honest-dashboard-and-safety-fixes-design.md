@@ -9,16 +9,17 @@
 
 ## 1. Background
 
-Phase 4 cleanup (PR #5) landed Apr 30 – May 2. It wired the bot toggle, real bot-status pill from `agent_logs`, dynamic position filter pills, and a `cricket_matches` writer. After that landed, an audit surfaced a remaining list of placeholders (cosmetic and substantive) plus two safety items the strict-auth-gating plan never finished landing. This spec addresses both in one branch.
+Phase 4 cleanup (PR #5) landed Apr 30 – May 2. It wired the bot toggle, real bot-status pill from `agent_logs`, dynamic position filter pills, and a `cricket_matches` writer. After that landed, an audit surfaced a remaining list of placeholders (cosmetic and substantive) plus a known correctness gap in trailing-stop math. This spec addresses both in one branch.
 
 This is not a feature — it's a cleanup. **No new endpoints, no new agents, no new screens.** Every change either deletes a lie or fixes a known correctness gap.
+
+**Note on prior plan:** The earlier audit incorrectly flagged strict-auth-gating Tasks 2 & 3 as not yet landed. They ARE landed (`kalshi_client.py:177-187` for init guard, `kalshi_client.py:510-519` for place_limit_order guard) AND tested (`tests/test_kalshi_client.py:291-391`, four cases). So strict-auth is fully done — no work in this branch.
 
 ## 2. Goals
 
 1. **Nothing on the rendered dashboard is fake.** If we don't have real data, the panel doesn't render.
-2. **Strict-auth gating is complete** — production cannot start with missing Kalshi creds, and `place_limit_order` cannot return a stub order in prod.
-3. **Trailing-stop math uses real per-position state**, not a hardcoded "opened 10 minutes ago, peak P&L = 0."
-4. **DB hygiene** — orphaned ghost rows in `positions` are cleaned up at the source, dead schema (`exit_decisions`, `markets`) is dropped.
+2. **Trailing-stop math uses real per-position state**, not a hardcoded "opened 10 minutes ago, peak P&L = 0."
+3. **DB hygiene** — orphaned ghost rows in `positions` are cleaned up at the source, dead schema (`exit_decisions`, `markets`) is dropped.
 
 ## 3. Non-goals
 
@@ -30,7 +31,7 @@ This is not a feature — it's a cleanup. **No new endpoints, no new agents, no 
 
 ## 4. Architecture overview
 
-Five units of change, each independently testable:
+Four units of change, each independently testable:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -42,13 +43,10 @@ Five units of change, each independently testable:
 │   • Standings: remove 2 dead buttons                        │
 │   • Cricket-charts: neutral defaults instead of fake teams  │
 ├─────────────────────────────────────────────────────────────┤
-│ Unit B — Strict-auth gating completion                      │
-│   • KalshiClient.__init__ raises in strict mode + unauthed  │
-│   • place_limit_order raises on prod + unauthed             │
-├─────────────────────────────────────────────────────────────┤
 │ Unit C — Trailing-stop correctness                          │
-│   • Read opened_at + peak_pnl_cents from positions table    │
-│   • Add peak_pnl_cents column + writer in sync_service      │
+│   • Add peak_pnl_cents column to positions table            │
+│   • sync_service writes peak_pnl_cents on every sync        │
+│   • orchestrator reads opened_at + peak_pnl_cents from DB   │
 ├─────────────────────────────────────────────────────────────┤
 │ Unit D — Position writer hygiene                            │
 │   • Skip writing flat positions (yes_count + no_count == 0) │
@@ -61,7 +59,7 @@ Five units of change, each independently testable:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-Units are mostly independent; Unit C touches `database.py` schema (adds `peak_pnl_cents` column) and `sync_service.py` writer (sets it), so it sequences before Unit D in the same file. Unit E also touches `database.py` schema. The migrations all live in the same `_migrate()` function and apply in defined order.
+Units are mostly independent. Unit C and Unit E both touch `database.py` schema; Unit C and Unit D both touch `sync_service.py`. All migrations live in `_migrate()` and apply in defined order — copy the existing pattern at `database.py:195-199`.
 
 ## 5. Component specs
 
@@ -93,37 +91,6 @@ Net result: Trends screen renders only the live scoreboard + Manhattan chart + r
 
 **A4. Cricket-charts neutral defaults.**
 - `cricket-charts.jsx:196-202`: change `Scoreboard` defaults from `teamA="MUM", teamB="CHE", runsA=142, ..., venue="Wankhede · 19:30 IST"` to `teamA="—", teamB="—", runsA=0, wicketsA=0, oversA="0.0", runsB=0, wicketsB=0, oversB="0.0", status="", venue="", innings=""`. Defaults should never be visually fake even though they're always overridden in production.
-
-### Unit B — Strict-auth gating completion
-
-Reference: `docs/superpowers/plans/2026-05-01-strict-external-service-auth-gating.md` Tasks 2 & 3.
-
-**B1. KalshiClient strict-mode init guard.**
-
-In `gully-engine/kalshi_client.py`, after the existing init-time auth check (around line 172-189), add:
-```python
-if not self._authed and settings.strict_external_services:
-    raise RuntimeError(
-        "KalshiClient cannot start in strict mode without valid credentials. "
-        "Set KALSHI_API_KEY_ID + KALSHI_PRIVATE_KEY_PATH or run with "
-        "GULLYTRADER_STRICT_EXTERNAL_SERVICES=false (dev only)."
-    )
-```
-
-**B2. `place_limit_order` prod guard.**
-
-At the top of `KalshiClient.place_limit_order` (around line 493):
-```python
-if not self._authed:
-    if settings.kalshi_api_env == "prod":
-        raise RuntimeError(
-            "Refusing to place stub order in prod environment without auth. "
-            "This would silently no-op a real trade."
-        )
-    return {"order_id": "stub-order", ...}  # existing dev fallback
-```
-
-The dev path remains unchanged so local testing stays frictionless.
 
 ### Unit C — Trailing-stop correctness
 
@@ -193,14 +160,12 @@ TDD per unit. New tests mocked at the same layer as existing tests (HTTP for Kal
 | Unit | New tests | Existing tests to update |
 |---|---|---|
 | A1-A4 | None (no-build frontend; manual smoke) | None |
-| B1 | `test_kalshi_client_strict_mode.py` — assert raises when strict + unauthed; assert OK when strict + authed; assert OK when not strict + unauthed | `test_kalshi_client.py` may need a `strict_external_services=False` setting override for any tests that construct an unauthed client |
-| B2 | `test_kalshi_place_order_prod_guard.py` — assert raises when prod + unauthed; assert returns stub when demo + unauthed | None |
 | C1-C3 | `test_orchestrator_exit_uses_real_position_state.py` — seed positions with known `opened_at` and `peak_pnl_cents`, assert `PositionSnapshot` reflects them; assert missing-position-row case logs and skips | `test_sync_service.py` — assert `peak_pnl_cents` is updated on each sync |
 | D1 | `test_sync_service_skips_flat_positions.py` — feed mock `KalshiPosition(yes_count=0, no_count=0)`, assert no row written | `test_sync_service.py` — verify existing positions tests still pass |
 | D2 | `test_database_migration_purges_orphan_positions.py` — seed pre-migration DB with mix of orphans and real positions, run migration, assert orphans gone, real preserved | None |
 | E1, E2 | `test_database_migration_drops_dead_schema.py` — assert tables don't exist post-migration | None |
 
-**Test count delta:** +6 new test files, ~15 new test cases. Current 145 → expected ~160.
+**Test count delta:** +4 new test files, ~10 new test cases. Current 145 → expected ~155.
 
 **Manual verification gate** (post-implementation):
 - Boot `cd gully-engine && uvicorn main:app --reload --port 8001`.
@@ -215,14 +180,12 @@ TDD per unit. New tests mocked at the same layer as existing tests (HTTP for Kal
 Build order:
 1. **Unit E** (drop dead schema) — safest, no behavior impact, just hygiene.
 2. **Unit D** (position writer hygiene) — fixes ongoing ghost-row creation + cleans existing.
-3. **Unit C** (trailing-stop correctness) — schema add + writer + reader; depends on `positions` being clean (Unit D first).
-4. **Unit B** (strict-auth gating) — backend safety, isolated from above.
-5. **Unit A** (frontend) — no test coverage, manual verify last.
+3. **Unit C** (trailing-stop correctness) — schema add + writer + reader; lands after D so peak_pnl_cents writes start on a clean positions table.
+4. **Unit A** (frontend) — no test coverage, manual verify last.
 
 **Risks:**
-- **Unit C reader race**: if exit-monitor reads `positions` before the first sync writes `peak_pnl_cents`, the SELECT returns NULL. Handled in C3 (skip + log).
+- **Unit C reader race**: if exit-monitor reads `positions` before the first sync writes `peak_pnl_cents`, the column is `0` (default), not NULL. Trailing-stop won't fire on first tick — that's acceptable.
 - **Unit D2 over-deletion**: `realized_pnl_cents = 0` filter protects closed-with-pnl rows; verified with a test.
-- **Unit B1 surprise breakage**: any dev who has stale `.env` with no creds will see uvicorn refuse to start. Mitigation: the existing strict-auth-gating plan already added `_strict_default()` that returns `False` outside prod, so dev is unaffected by default.
 
 ## 10. Out of scope (future)
 
