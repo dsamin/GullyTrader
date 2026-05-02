@@ -168,8 +168,14 @@ def _team_code(name: str | None) -> str:
 class CricApiFeed:
     """Cricket data via CricAPI (cricketdata.org).
 
-    Free tier is 100 hits/day; the M tier ($12.99/mo) is 10K/day. Calls are
-    counted per HTTP request to /v1/* — `.live_match()` does at most 2.
+    Strategy: find the IPL series_id once (and cache forever per process), then
+    use `/series_info` to pull the full IPL match list — one hit gets us all
+    70 matches of an IPL season with start times and status flags. The result
+    is in-memory cached for `cache_ttl_seconds` so dashboard polling doesn't
+    burn the free tier (100 hits/day) on every request.
+
+    `/currentMatches` and `/matches` are global across cricket and require
+    paging through 14K rows to find IPL — not viable on the free tier.
 
     Defensive: this client tolerates response-shape variation. On any error
     (network, HTTP 4xx, missing key, malformed payload) it logs and returns
@@ -180,12 +186,17 @@ class CricApiFeed:
     IPL_KEYWORDS = ("indian premier league", "ipl")
 
     def __init__(self, api_key: str, *, base_url: str | None = None,
-                 http: requests.Session | None = None) -> None:
+                 http: requests.Session | None = None,
+                 cache_ttl_seconds: int = 60) -> None:
         if not api_key:
             log.warning("CricApiFeed instantiated without an API key — calls will fail")
         self.api_key = api_key
         self.base_url = (base_url or self.BASE_URL).rstrip("/")
         self.http = http or requests.Session()
+        self.cache_ttl_seconds = cache_ttl_seconds
+        self._ipl_series_id: str | None = None
+        self._match_list_cache: list[dict] = []
+        self._match_list_cached_at: float = 0.0
 
     # ── HTTP plumbing ──────────────────────────────────────────────────
 
@@ -223,72 +234,120 @@ class CricApiFeed:
         n = name.lower()
         return any(k in n for k in CricApiFeed.IPL_KEYWORDS)
 
+    # ── IPL series discovery + cache ───────────────────────────────────
+
+    def _find_ipl_series_id(self) -> str | None:
+        """Locate the current IPL season's series_id. Cached for the lifetime
+        of the instance — IPL seasons run March-May, so the id is stable."""
+        if self._ipl_series_id:
+            return self._ipl_series_id
+        # Search up to 10 pages (~250 series) — IPL is usually within first 100
+        for offset in range(0, 250, 25):
+            resp = self._get("series", offset=offset)
+            for s in resp.get("data") or []:
+                if self._is_ipl(s.get("name")):
+                    sid = s.get("id")
+                    if sid:
+                        self._ipl_series_id = sid
+                        log.info("CricAPI: locked IPL series_id %s (%s)",
+                                 sid, s.get("name"))
+                        return sid
+            if not (resp.get("data") or []):
+                break
+        log.warning("CricAPI: no IPL series found in first 250 entries")
+        return None
+
+    def _ipl_match_list(self) -> list[dict]:
+        """Fetch the full IPL match list, in-memory-cached for cache_ttl_seconds.
+
+        One call to /series_info returns all 70 IPL season matches with status
+        flags and start times. Subsequent calls within the TTL hit cache.
+        """
+        import time
+        now = time.time()
+        if self._match_list_cache and (now - self._match_list_cached_at) < self.cache_ttl_seconds:
+            return self._match_list_cache
+
+        sid = self._find_ipl_series_id()
+        if not sid:
+            return []
+        info = self._get("series_info", id=sid)
+        matches = (info.get("data") or {}).get("matchList") or []
+        if matches:
+            self._match_list_cache = matches
+            self._match_list_cached_at = now
+        return matches
+
     # ── Public API (matches CricketFeed protocol) ──────────────────────
 
     def live_match(self) -> LiveScore | None:
         """First in-progress IPL match, if any."""
-        resp = self._get("currentMatches", offset=0)
-        for m in resp.get("data") or []:
-            series = m.get("series") or m.get("name") or ""
-            if not self._is_ipl(series):
-                continue
-            if not (m.get("matchStarted") and not m.get("matchEnded")):
-                continue
-            return self._to_live_score(m)
+        for m in self._ipl_match_list():
+            if m.get("matchStarted") and not m.get("matchEnded"):
+                return self._to_live_score(m)
         return None
 
     def upcoming_fixtures(self) -> list[Fixture]:
-        """Next IPL fixtures that haven't started yet."""
-        resp = self._get("matches", offset=0)
+        """Next IPL fixtures that haven't started yet, sorted by start time."""
+        matches = self._ipl_match_list()
         out: list[Fixture] = []
-        for m in resp.get("data") or []:
-            if not self._is_ipl(m.get("series") or m.get("name")):
-                continue
+        for m in matches:
             if m.get("matchStarted"):
                 continue
             try:
                 out.append(self._to_fixture(m))
             except Exception as e:  # noqa: BLE001 — single bad row shouldn't kill the list
                 log.warning("CricAPI fixture parse failed for %s: %s", m.get("id"), e)
-        return out
+        out.sort(key=lambda f: f.start_time_iso or "")
+        return out[:10]
 
     def standings(self) -> list[StandingsRow]:
-        """IPL points table.
+        """IPL points table via /series_points.
 
-        Implementation note: CricAPI exposes points-table data via the series
-        endpoints, but the schema isn't stable across seasons. Returning an
-        empty list when we can't find the IPL series is safer than guessing.
+        CricAPI returns rows like:
+            {teamname, shortname, matches, wins, loss, ties, nr}
+        Note `loss` (singular) and no `points`/`nrr` columns. T20 league
+        scoring is `2*wins + ties + nr` (1 point each for tie/no-result), so
+        we derive `points` ourselves. NRR isn't surfaced by the free endpoint;
+        leave as "0.000" until we wire a richer source.
         """
-        resp = self._get("series", offset=0)
-        ipl_series_id = None
-        for s in resp.get("data") or []:
-            if self._is_ipl(s.get("name")):
-                ipl_series_id = s.get("id")
-                break
-        if not ipl_series_id:
+        sid = self._find_ipl_series_id()
+        if not sid:
             return []
-        info = self._get("series_info", id=ipl_series_id)
+        resp = self._get("series_points", id=sid)
+        table = resp.get("data") or []
+        # /series_info also sometimes returns a pointsTable on data.* — fall back if needed.
+        if not table:
+            info = self._get("series_info", id=sid)
+            sdata = info.get("data") or {}
+            table = sdata.get("pointsTable") \
+                    or (sdata.get("info") or {}).get("pointsTable") \
+                    or []
+
         rows: list[StandingsRow] = []
-        # CricAPI returns points table under various keys depending on season —
-        # try a few. If none match, return an empty list rather than raising.
-        table = (info.get("data") or {}).get("pointsTable") \
-                or info.get("pointsTable") \
-                or []
         for r in table:
             try:
+                wins = int(r.get("wins") or 0)
+                losses = int(r.get("losses") or r.get("loss") or 0)
+                ties = int(r.get("ties") or 0)
+                nr = int(r.get("nr") or 0)
+                # Pre-computed points if present, else derive (2 per win, 1 per tie/NR).
+                points = int(r.get("points")) if r.get("points") is not None else (2 * wins + ties + nr)
                 rows.append(StandingsRow(
-                    code=_team_code(r.get("teamname") or r.get("name")),
+                    code=_team_code(r.get("teamname") or r.get("shortname") or r.get("name")),
                     name=r.get("teamname") or r.get("name") or "?",
                     played=int(r.get("matches") or r.get("played") or 0),
-                    wins=int(r.get("wins") or 0),
-                    losses=int(r.get("losses") or r.get("loss") or 0),
-                    points=int(r.get("points") or 0),
+                    wins=wins,
+                    losses=losses,
+                    points=points,
                     nrr=str(r.get("netrunrate") or r.get("nrr") or "0.000"),
-                    last_5=[],   # CricAPI's free tier doesn't include form history
+                    last_5=[],
                     playoff_probability=0,
                 ))
             except (ValueError, TypeError) as e:
                 log.warning("CricAPI standings row parse failed: %s", e)
+        # Sort by points desc — CricAPI sometimes returns alphabetical
+        rows.sort(key=lambda x: (-x.points, -x.wins))
         return rows
 
     # ── Mappers ────────────────────────────────────────────────────────
