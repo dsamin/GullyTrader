@@ -49,10 +49,18 @@ def _log_decision(agent: str, ticker: str, decision: str, reasoning: str) -> Non
 _stop_flag = threading.Event()
 _entry_lock = threading.Lock()
 _exit_lock = threading.Lock()
+_threads: list[threading.Thread] = []
+_running = False
 
 
 def stop() -> None:
+    global _running
     _stop_flag.set()
+    _running = False
+
+
+def is_running() -> bool:
+    return _running
 
 
 # ── Entry pipeline ────────────────────────────────────────────────────
@@ -216,10 +224,22 @@ def _exit_loop() -> None:
 # ── Lifecycle ─────────────────────────────────────────────────────────
 
 
-def start_threads() -> tuple[threading.Thread, threading.Thread]:
+def start_threads() -> tuple[threading.Thread, threading.Thread] | None:
+    """Start entry + exit loops. Idempotent — a second call while already
+    running is a no-op and returns None.
+
+    Clears `_stop_flag` so a start-after-stop cycle re-arms the loops.
+    """
+    global _running, _threads
+    if _running:
+        log.info("orchestrator: start_threads called while already running — no-op")
+        return None
+    _stop_flag.clear()
     entry_t = threading.Thread(target=_entry_loop, daemon=True, name="orch.entry")
     exit_t = threading.Thread(target=_exit_loop, daemon=True, name="orch.exit")
     entry_t.start()
     exit_t.start()
+    _threads = [entry_t, exit_t]
+    _running = True
     log.info("orchestrator: entry + exit threads started (exit_mode=%s)", settings.exit_mode)
     return entry_t, exit_t

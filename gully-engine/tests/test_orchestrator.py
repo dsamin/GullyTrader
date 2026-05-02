@@ -291,3 +291,40 @@ def test_run_exit_monitor_writes_exit_to_agent_logs(tmp_db):
     assert rows[0]["ticker"] == pos.ticker
     assert rows[0]["decision"] == "hold"
     assert "llm" in rows[0]["reasoning"]
+
+
+def test_orchestrator_start_threads_clears_stop_flag():
+    """A start_threads() call after stop() must clear _stop_flag so the new
+    threads don't see is_set() and immediately bail."""
+    import orchestrator
+    orchestrator.stop()
+    assert orchestrator._stop_flag.is_set()
+    try:
+        orchestrator.start_threads()
+        assert not orchestrator._stop_flag.is_set()
+    finally:
+        orchestrator.stop()
+
+
+def test_orchestrator_start_threads_is_idempotent():
+    """Calling start_threads twice must not spawn two pairs of loops."""
+    import orchestrator
+    try:
+        orchestrator.start_threads()
+        first_running = orchestrator.is_running()
+        orchestrator.start_threads()    # second call is a no-op
+        assert orchestrator.is_running() == first_running == True
+    finally:
+        orchestrator.stop()
+
+
+def test_orchestrator_is_running_reflects_state():
+    import orchestrator
+    orchestrator.stop()
+    assert orchestrator.is_running() is False
+    try:
+        orchestrator.start_threads()
+        assert orchestrator.is_running() is True
+    finally:
+        orchestrator.stop()
+        assert orchestrator.is_running() is False
