@@ -114,13 +114,9 @@ def evaluate(snap: PositionSnapshot, *, now: int | None = None) -> ExitDecision:
     if deterministic:
         return deterministic
 
-    # LLM path — wired up later in agents/portfolio_exit.py. For now: hold.
-    return ExitDecision(
-        ticker=snap.ticker,
-        trigger="llm",
-        action="hold",
-        mode=settings.exit_mode,
-        mark_price_cents=snap.mark_price_cents,
-        pnl_cents_at_decision=0,
-        note="llm placeholder: hold",
-    )
+    # LLM path — delegate to portfolio_exit agent.
+    # Imports inside the function: agents.portfolio_exit imports ExitDecision and
+    # PositionSnapshot from this module, so a top-level import would be circular.
+    from agents.portfolio_exit import decide as llm_decide
+    from cricket_data import get_feed
+    return llm_decide(snap, live=get_feed().live_match())

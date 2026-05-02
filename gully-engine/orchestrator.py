@@ -130,20 +130,43 @@ def run_exit_monitor_once(*, force: bool = False) -> dict:
         now = int(time.time())
         for p in positions:
             side = "yes" if p.yes_count >= p.no_count else "no"
-            mark = p.avg_cost_cents  # TODO: use latest market price
+            market = client.get_market(p.ticker)
+            if market is not None:
+                mark = market.yes_price if side == "yes" else market.no_price
+            else:
+                mark = p.avg_cost_cents   # fallback: stale mark; LLM will see zero P&L
             snap = PositionSnapshot(
                 ticker=p.ticker,
                 entry_price_cents=p.avg_cost_cents,
                 mark_price_cents=mark,
-                yes_count=p.yes_count,
-                no_count=p.no_count,
+                yes_count=p.yes_count, no_count=p.no_count,
                 side=side,
-                opened_at=now - 600,   # placeholder; replace with real timestamp
-                peak_pnl_cents=0,
+                opened_at=now - 600,    # TODO(phase-4): track real open time per position
+                peak_pnl_cents=0,       # TODO(phase-4): track peak P&L for trailing-stop
             )
-            decisions.append(evaluate(snap, now=now))
-        return {"status": "ok", "evaluated": len(decisions),
-                "actions": [{"ticker": d.ticker, "action": d.action, "trigger": d.trigger} for d in decisions]}
+            exit_dec = evaluate(snap, now=now)
+            order_resp = None
+            if exit_dec.action == "sell" and settings.exit_mode == "live":
+                try:
+                    order_resp = client.place_limit_order(
+                        ticker=p.ticker, side=side, action="sell",
+                        count=max(p.yes_count, p.no_count),
+                        limit_price_cents=max(1, mark - 1),
+                    )
+                except Exception as e:  # noqa: BLE001 — keep loop alive on order errors
+                    log.exception("orchestrator.exit: place_limit_order failed for %s", p.ticker)
+                    order_resp = {"error": str(e)}
+            decisions.append({
+                "ticker": exit_dec.ticker, "action": exit_dec.action,
+                "trigger": exit_dec.trigger, "mode": exit_dec.mode,
+                "note": exit_dec.note, "order": order_resp,
+            })
+        return {
+            "status": "ok",
+            "evaluated": len(decisions),
+            "exit_mode": settings.exit_mode,
+            "actions": decisions,
+        }
     finally:
         _exit_lock.release()
 
