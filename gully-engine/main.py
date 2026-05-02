@@ -55,6 +55,23 @@ STATIC_DIR = Path(__file__).parent / "static"
 async def lifespan(app: FastAPI):
     log.info("startup: initializing DB at %s", settings.db_path)
     database.initialize()
+
+    # One-line, grep-friendly banner: kalshi=authed/unauthed cricket=stub/cricapi strict=on/off env=demo/prod
+    try:
+        _kalshi_authed = KalshiClient()._authed
+        _kalshi_state = "authed" if _kalshi_authed else "unauthed"
+    except RuntimeError as e:
+        # Strict mode + missing Kalshi creds: re-raise so uvicorn fails to start.
+        log.error("startup: Kalshi auth check failed — %s", e)
+        raise
+    log.info(
+        "startup: GullyTrader auth state — kalshi=%s cricket=%s strict=%s env=%s",
+        _kalshi_state,
+        settings.cricket_feed_provider,
+        "on" if settings.strict_external_services else "off",
+        settings.kalshi_api_env,
+    )
+
     purged = database.purge_old_agent_logs()
     log.info("startup: purged %d old agent_logs rows", purged)
 
