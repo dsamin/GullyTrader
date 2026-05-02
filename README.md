@@ -20,7 +20,8 @@ Autonomous IPL prediction-market trader for Kalshi. Multi-agent LLM pipeline pic
 | Kalshi ↔ CricAPI reconciler (event-ticker parsing) | ✅ 8/10 fixtures correlate to Kalshi events |
 | Scanner agent (LLM-ranked market candidates) | ✅ ~16s round-trip, real grounded reasoning |
 | Researcher / Decision / Exit agents | ⏳ stubs — see [docs/HANDOFF.md](docs/HANDOFF.md) |
-| Tests | ✅ 94 passing |
+| Strict-mode auth gating (prod-default; raises on missing creds) | ✅ live |
+| Tests | ✅ 102 passing |
 
 ## Stack
 
@@ -74,6 +75,27 @@ GULLYTRADER_ENABLE_ORCHESTRATOR=1 uvicorn main:app --port 8001
 ```
 
 Open http://localhost:8001 — the dashboard pulls real balance + IPL events from Kalshi and live IPL fixtures from CricAPI.
+
+### Production safety: strict mode
+
+By default, missing Kalshi creds or a missing CricAPI key fall back to mock data — handy in dev (you can hit the dashboard without filling out `.env` first), dangerous in prod (a real-money order routed to a stub returns `{"order_id": "stub-order"}` and silently no-ops).
+
+**Strict mode** is auto-enabled when `KALSHI_API_ENV=prod` and turns these silent fallbacks into loud startup failures:
+
+| Condition | Strict (prod default) | Non-strict (dev default) |
+|---|---|---|
+| Kalshi creds missing at boot | refuses to start | logs warning, mocks data |
+| `CRICKET_FEED_PROVIDER=cricapi` but no key | refuses to start | logs warning, falls back to stub |
+| `CRICKET_FEED_PROVIDER=stub` | logs WARNING (you're on mock cricket data!) | quiet (expected dev posture) |
+| `place_limit_order` in `KALSHI_API_ENV=prod` with no creds | **always raises**, regardless of strict flag | n/a |
+
+Override via env: `GULLYTRADER_STRICT_EXTERNAL_SERVICES=1` to force strict, `=0` to force non-strict. Useful for staging environments that point at prod Kalshi but want explicit control.
+
+The startup banner logs the resolved state on one grep-friendly line:
+
+```
+startup: GullyTrader auth state — kalshi=authed cricket=cricapi strict=on env=prod
+```
 
 For day-to-day operations (debugging, inspecting logs, triggering manual passes): [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
