@@ -26,6 +26,26 @@ from settings import settings
 
 log = logging.getLogger(__name__)
 
+
+def _log_decision(agent: str, ticker: str, decision: str, reasoning: str) -> None:
+    """Write a single agent_logs row for a non-LLM orchestrator decision.
+
+    The LLM-driven agents (scanner, researcher, exit) self-log via llm.chat_json.
+    The pure-math Decision agent and the deterministic exit-monitor branches don't,
+    so the orchestrator emits an explicit row so /api/bot/status can read them.
+    """
+    import database  # local import — keeps module load order stable in tests
+    try:
+        with database.write_conn() as conn:
+            conn.execute(
+                "INSERT INTO agent_logs (agent, ticker, decision, reasoning, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (agent, ticker, decision, reasoning, int(time.time())),
+            )
+    except Exception:  # noqa: BLE001 — DB write failure must not crash the loop
+        log.exception("orchestrator: failed to write agent_log %s/%s", agent, ticker)
+
+
 _stop_flag = threading.Event()
 _entry_lock = threading.Lock()
 _exit_lock = threading.Lock()
@@ -71,6 +91,12 @@ def run_entry_pipeline_once(*, force: bool = False) -> dict:
                 continue
             note = research(market, live)
             dec = decide(note, bankroll_cents=balance, market=market)
+            _log_decision(
+                agent="decision",
+                ticker=dec.ticker,
+                decision=dec.action,
+                reasoning=dec.reasoning,
+            )
             order_resp = None
             if dec.action != "pass" and settings.decision_mode == "live":
                 side = "yes" if dec.action == "buy_yes" else "no"

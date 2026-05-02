@@ -8,11 +8,28 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+import database
 import orchestrator
 from agents.decision import TradeDecision
 from agents.researcher import ResearchNote
 from exit_monitor import ExitDecision
 from kalshi_client import KalshiMarket, KalshiPosition
+
+
+@pytest.fixture
+def tmp_db(tmp_path):
+    """Point settings.db_path at a tmp file and run schema."""
+    from settings import settings as _settings
+    db_path = tmp_path / "test.db"
+    original = _settings.db_path
+    object.__setattr__(_settings, "db_path", db_path)
+    try:
+        database.initialize(db_path)
+        yield db_path
+    finally:
+        object.__setattr__(_settings, "db_path", original)
 
 
 def _set_settings(**overrides):
@@ -209,3 +226,40 @@ def test_exit_pipeline_fetches_real_mark_via_get_market():
         client.get_market.assert_called_once_with("KXIPLGAME-T")
     finally:
         restore()
+
+
+def test_run_entry_pipeline_writes_decision_to_agent_logs(tmp_db):
+    """Each candidate's decision must land in agent_logs as agent='decision'."""
+    market = _market("KXIPLGAME-26-MUM", yes=58)
+    fake_client = type("C", (), {})()
+    fake_client.list_ipl_markets = lambda: [market]
+    fake_client.get_balance = lambda: {"balance": 100_00}
+    fake_client.place_limit_order = lambda **kw: {"order_id": "o1"}
+
+    note = ResearchNote(
+        ticker=market.ticker, estimated_yes_probability=0.65,
+        confidence=0.8, reasoning="strong form",
+    )
+    decision = TradeDecision(
+        ticker=market.ticker, action="buy_yes", contracts=10,
+        limit_price_cents=59, reasoning="edge=+7c kelly=0.20 -> 10 ct",
+    )
+
+    candidate = type("C", (), {"ticker": market.ticker, "score": 9, "reason": "x"})()
+
+    with patch("orchestrator.KalshiClient", return_value=fake_client), \
+         patch("orchestrator.scanner_shortlist", return_value=[candidate]), \
+         patch("orchestrator.research", return_value=note), \
+         patch("orchestrator.decide", return_value=decision), \
+         patch("orchestrator.get_feed") as gf:
+        gf.return_value.live_match = lambda: None
+        orchestrator.run_entry_pipeline_once(force=True)
+
+    with database.connect(tmp_db) as conn:
+        rows = conn.execute(
+            "SELECT agent, ticker, decision, reasoning FROM agent_logs WHERE agent='decision'"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["ticker"] == market.ticker
+    assert rows[0]["decision"] == "buy_yes"
+    assert "edge=+7c" in rows[0]["reasoning"]
