@@ -10,8 +10,9 @@ Deep reference for how GullyTrader's pieces fit together. For "what's done / wha
                             │                        │
    browser ───── HTTP ─────▶│  /         (React UI)  │
                             │  /static/* (assets)    │
-                            │  /api/portfolio        │
+                            │  /api/portfolio        │  ←── portfolio.compute_metrics()
                             │  /api/positions        │
+                            │  /api/trades           │  ←── portfolio.recent_fills()
                             │  /api/match/live       │◀──── reconciler ───▶ Kalshi event
                             │  /api/match/{id}/...   │                       (KXIPLGAME-...)
                             │  /api/events/ipl       │
@@ -32,6 +33,8 @@ Deep reference for how GullyTrader's pieces fit together. For "what's done / wha
         │  • markets/event │  │  • standings    │  │           ─→ Decision    │
         │  • positions     │  │                 │  │           ─→ buy order   │
         │  • orders        │  │  60s match-list │  │                          │
+        │  • fills         │  │  in-proc cache  │  │                          │
+        │  • settlements   │  │                 │  │                          │
         │                  │  │  in-proc cache  │  │  Exit monitor ───────────┤
         │  RateLimiter:    │  │                 │  │    hard stops bypass LLM │
         │  18 reads/sec    │  │  IPL series_id  │  │    LLM for nuanced exits │
@@ -55,8 +58,13 @@ Deep reference for how GullyTrader's pieces fit together. For "what's done / wha
 
         ┌───────────────────────────────────────────────────┐
         │  Sync service (3rd daemon thread, when enabled)   │
-        │   pulls orders / fills / settlements every 45-180s│
-        │   keeps alive on transient SQLite/Kalshi failures │
+        │   pulls positions / orders / fills / settlements  │
+        │   from Kalshi every SYNC_INTERVAL_SECONDS (60s),  │
+        │   upserts into SQLite (idempotent — trade_id /    │
+        │   order_id / ticker uniques). Settlements update  │
+        │   the matching positions row → status='closed'.   │
+        │   Per-endpoint try/except keeps loop alive on     │
+        │   transient SQLite or Kalshi failures.            │
         └───────────────────────────────────────────────────┘
 ```
 
@@ -67,13 +75,14 @@ Deep reference for how GullyTrader's pieces fit together. For "what's done / wha
 | [`main.py`](../gully-engine/main.py) | FastAPI app. Mounts `/static`, exposes `/api/*`, manages lifespan (DB init, log purge, optional thread spin-up). |
 | [`settings.py`](../gully-engine/settings.py) | Single Settings dataclass loaded from `.env`. Mirrors KalshiTrader's env naming so a single `.env` powers both projects. |
 | [`database.py`](../gully-engine/database.py) | SQLite schema + WAL connection helpers. `write_conn` is a context manager that try/finally-closes (PR #50 pattern from KalshiTrader). |
-| [`kalshi_client.py`](../gully-engine/kalshi_client.py) | Kalshi v2 client. RSA-PSS-SHA256 signing (`KALSHI-ACCESS-*` headers, signed path includes `/trade-api/v2`), built-in rate limiter, defensive parsing (defaults `value=0` to 100). Returns mock data when unauthed. |
+| [`kalshi_client.py`](../gully-engine/kalshi_client.py) | Kalshi v2 client. RSA-PSS-SHA256 signing (`KALSHI-ACCESS-*` headers, signed path includes `/trade-api/v2`), built-in rate limiter, defensive parsing (defaults `value=0` to 100, `yes_price=None` to 0). Read methods: `list_ipl_events`, `list_event_markets`, `get_market`, `list_positions`, `list_orders`, `list_fills`, `list_settlements`, `get_balance`. Write methods: `place_limit_order`, `cancel_order`. `list_settlements` applies the paired-position correction inline so callers always get the corrected `net_pnl_cents`. Returns mock data when unauthed. |
+| [`portfolio.py`](../gully-engine/portfolio.py) | DB-derived metrics. `compute_metrics()` aggregates `settlements` and `positions` into the day-P&L / ROI / win-rate / streak / 20-day sparkline blob `/api/portfolio` returns. `recent_fills()` and `recent_settled_positions()` back `/api/trades` and the Positions screen. All metrics return zero / empty when the DB is empty (fresh install) — never raise. |
 | [`cricket_data.py`](../gully-engine/cricket_data.py) | `CricketFeed` protocol with `StubCricketFeed` (design figures) and `CricApiFeed` (cricketdata.org). The cricapi feed locates the IPL series_id once per process, then pulls all 70 matches from `/series_info` with a 60s in-process cache. |
 | [`reconciler.py`](../gully-engine/reconciler.py) | Parses Kalshi event tickers like `KXIPLGAME-26MAY07RCBLSG` → `(2026-05-07, RCB, LSG)`. Greedy-splits the franchise concatenation against a known set (PBKS resolves before PB+KS). Maps Kalshi codes ↔ design codes (MI→MUM, CSK→CHE, etc.). Used by `/api/match/live` and `/api/fixtures` to attach a `kalshi_event_ticker` to each cricket-feed match. |
 | [`pnl.py`](../gully-engine/pnl.py) | The paired-position P&L correction (load-bearing — see [README#inherited-kalshi-learnings](../README.md#inherited-kalshi-learnings)). |
 | [`exit_monitor.py`](../gully-engine/exit_monitor.py) | Hard-stop matrix (stop loss / trailing / time). Returns an `ExitDecision`; LLM is only called when none of the deterministic stops fire. |
 | [`orchestrator.py`](../gully-engine/orchestrator.py) | Two daemon threads (entry + exit). Manual triggers use non-blocking locks so calls don't queue on a long-running pass. |
-| [`sync_service.py`](../gully-engine/sync_service.py) | Background reconciliation loop. Currently a scaffold — `_reconcile_once()` is a stub. Loop keep-alive logic is real (PR #54 pattern). |
+| [`sync_service.py`](../gully-engine/sync_service.py) | Background reconciliation loop. `_reconcile_once()` pulls positions / orders / fills / settlements from Kalshi and upserts them into the matching SQLite tables (`UNIQUE(ticker)` for positions/settlements, `UNIQUE(kalshi_order_id)` for orders, `UNIQUE(kalshi_trade_id)` partial index for fills). Each endpoint is independently try/except'd so one Kalshi 503 can't kill the loop. Loop keep-alive logic from KalshiTrader PR #54. |
 | [`llm.py`](../gully-engine/llm.py) | OpenRouter chat-completions client with JSON mode. Persists every call to `agent_logs` (audit trail). Failures return `None` rather than raising so the caller decides on fallback. |
 | [`agents/scanner.py`](../gully-engine/agents/scanner.py) | Implemented. Prompts qwen-2.5-72b to rank open IPL markets by edge. Drops scores < 30, drops hallucinated tickers, falls back to first-N when LLM is unreachable. |
 | [`agents/researcher.py`](../gully-engine/agents/researcher.py) | Stub. Should consume scanner output, pull live ball-by-ball context, return `ResearchNote{estimated_yes_probability, confidence, reasoning}`. |
@@ -89,8 +98,12 @@ browser GET /
    ├─ FastAPI returns static/index.html (React + Babel via CDN)
    └─ React mounts, calls /api/portfolio, /api/positions, /api/match/live,
       /api/fixtures, /api/standings, /api/bot/status in parallel.
-        ├─ /api/portfolio    → KalshiClient.get_balance()
+        ├─ /api/portfolio    → KalshiClient.get_balance() + portfolio.compute_metrics()
+        │                      (metrics derived from settlements + positions tables)
         ├─ /api/positions    → KalshiClient.list_positions()
+        │                      + KalshiClient.get_market(ticker) per row for real mark
+        │                      + portfolio.recent_settled_positions() for the settled tab
+        ├─ /api/trades       → portfolio.recent_fills()  (latest 50 executions from DB)
         ├─ /api/match/live   → CricApiFeed.live_match()
         │                      + reconciler.kalshi_event_for_live_match()
         │                        (matches the live game to a Kalshi KXIPLGAME event)
@@ -98,6 +111,20 @@ browser GET /
         │                      + reconciler.kalshi_event_for_fixture() per row
         ├─ /api/standings    → CricApiFeed.standings()
         └─ /api/bot/status   → settings (no I/O)
+```
+
+### 1b. Background reconciliation (when orchestrator enabled)
+
+```
+sync_service thread (every SYNC_INTERVAL_SECONDS, default 60):
+   _reconcile_once()
+     ├─ KalshiClient.list_positions()    →  upsert into positions     (UNIQUE ticker)
+     ├─ KalshiClient.list_orders()       →  upsert into orders        (UNIQUE kalshi_order_id)
+     ├─ KalshiClient.list_fills()        →  insert into fills          (dedup kalshi_trade_id)
+     └─ KalshiClient.list_settlements()  →  upsert into settlements   (UNIQUE ticker)
+                                          + UPDATE positions SET status='closed',
+                                                                realized_pnl_cents=...
+                                                                WHERE ticker=...
 ```
 
 ### 2. Manual entry-pipeline trigger (current state)

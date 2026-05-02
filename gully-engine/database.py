@@ -69,13 +69,19 @@ CREATE INDEX IF NOT EXISTS orders_ticker_idx ON orders(ticker);
 
 CREATE TABLE IF NOT EXISTS fills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kalshi_trade_id TEXT,
+    kalshi_order_id TEXT,
     order_id INTEGER REFERENCES orders(id),
     ticker TEXT NOT NULL,
     side TEXT NOT NULL,
+    action TEXT,
     count INTEGER NOT NULL,
     price_cents INTEGER NOT NULL,
+    is_taker INTEGER DEFAULT 0,
     filled_at INTEGER NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS fills_ticker_idx ON fills(ticker);
 
 CREATE TABLE IF NOT EXISTS settlements (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,6 +162,34 @@ def initialize(path: Path | str | None = None) -> None:
     """Apply schema (idempotent)."""
     with connect(path) as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply column additions for tables that pre-date a schema change.
+
+    SQLite's ALTER TABLE ADD COLUMN is not idempotent on its own, so we wrap
+    each new column in a try/except. Pre-alpha migration discipline; sufficient
+    while the engine is still hobby-tier.
+    """
+    additions = [
+        ("fills", "kalshi_trade_id", "TEXT"),
+        ("fills", "kalshi_order_id", "TEXT"),
+        ("fills", "action", "TEXT"),
+        ("fills", "is_taker", "INTEGER DEFAULT 0"),
+    ]
+    for table, col, decl in additions:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        except sqlite3.OperationalError:
+            pass   # column already exists
+
+    # Index creation has to run AFTER any ADD COLUMN — the index references
+    # kalshi_trade_id, which doesn't exist on pre-migration DBs.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS fills_trade_id_idx "
+        "ON fills(kalshi_trade_id) WHERE kalshi_trade_id IS NOT NULL"
+    )
 
 
 @contextlib.contextmanager

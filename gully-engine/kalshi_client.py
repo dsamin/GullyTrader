@@ -28,7 +28,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-from pnl import normalize_contract_value
+from pnl import normalize_contract_value, realized_pnl
 from settings import settings
 
 
@@ -67,6 +67,45 @@ class KalshiEvent:
     category: str = ""
     mutually_exclusive: bool = False
     metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class KalshiOrder:
+    order_id: str
+    ticker: str
+    side: str                  # 'yes' | 'no'
+    action: str                # 'buy' | 'sell'
+    status: str                # 'resting' | 'executed' | 'canceled' | ...
+    count: int
+    limit_price_cents: int
+    created_time: str = ""
+    last_update_time: str = ""
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class KalshiFill:
+    trade_id: str
+    order_id: str
+    ticker: str
+    side: str                  # 'yes' | 'no'
+    action: str                # 'buy' | 'sell'
+    count: int
+    price_cents: int
+    is_taker: bool
+    created_time: str = ""
+
+
+@dataclass
+class KalshiSettlement:
+    ticker: str
+    market_result: str         # 'yes' | 'no' | 'void'
+    revenue_cents: int         # already includes paired-position correction
+    cost_cents: int
+    net_pnl_cents: int
+    yes_count: int
+    no_count: int
+    settled_time: str = ""
 
 
 # IPL series tickers Kalshi actually uses (verified 2026-04-30):
@@ -321,6 +360,135 @@ class KalshiClient:
             )
             for p in resp.get("market_positions", resp.get("positions", []))
         ]
+
+    def list_orders(self, *, status: str | None = None, max_pages: int = 25) -> list[KalshiOrder]:
+        """Fetch orders from Kalshi /portfolio/orders, paged via cursor."""
+        if not self._authed:
+            return []
+        out: list[KalshiOrder] = []
+        cursor: str | None = None
+        for _ in range(max_pages):
+            params: dict = {"limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            if status:
+                params["status"] = status
+            resp = self._request("GET", "/portfolio/orders", params=params)
+            if "error" in resp:
+                break
+            for o in resp.get("orders", []):
+                out.append(self._order_from_dict(o))
+            cursor = resp.get("cursor")
+            if not cursor:
+                break
+        return out
+
+    def list_fills(self, *, max_pages: int = 25) -> list[KalshiFill]:
+        """Fetch executed fills from Kalshi /portfolio/fills."""
+        if not self._authed:
+            return []
+        out: list[KalshiFill] = []
+        cursor: str | None = None
+        for _ in range(max_pages):
+            params: dict = {"limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            resp = self._request("GET", "/portfolio/fills", params=params)
+            if "error" in resp:
+                break
+            for f in resp.get("fills", []):
+                out.append(self._fill_from_dict(f))
+            cursor = resp.get("cursor")
+            if not cursor:
+                break
+        return out
+
+    def list_settlements(self, *, max_pages: int = 25) -> list[KalshiSettlement]:
+        """Fetch settled markets from Kalshi /portfolio/settlements.
+
+        Applies the paired-position correction (see pnl.realized_pnl) so
+        positions that exited via the opposing side don't surface phantom losses.
+        """
+        if not self._authed:
+            return []
+        out: list[KalshiSettlement] = []
+        cursor: str | None = None
+        for _ in range(max_pages):
+            params: dict = {"limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            resp = self._request("GET", "/portfolio/settlements", params=params)
+            if "error" in resp:
+                break
+            for s in resp.get("settlements", []):
+                out.append(self._settlement_from_dict(s))
+            cursor = resp.get("cursor")
+            if not cursor:
+                break
+        return out
+
+    @staticmethod
+    def _order_from_dict(o: dict) -> KalshiOrder:
+        side = (o.get("side") or "").lower()
+        price_raw = o.get("yes_price") if side == "yes" else o.get("no_price")
+        price = int(price_raw or 0)
+        return KalshiOrder(
+            order_id=o.get("order_id", ""),
+            ticker=o.get("ticker", ""),
+            side=side,
+            action=(o.get("action") or "").lower(),
+            status=(o.get("status") or "").lower(),
+            count=int(o.get("count") or 0),
+            limit_price_cents=price,
+            created_time=o.get("created_time", ""),
+            last_update_time=o.get("last_update_time", ""),
+            metadata={k: v for k, v in o.items() if k not in
+                      {"order_id", "ticker", "side", "action", "status",
+                       "count", "yes_price", "no_price",
+                       "created_time", "last_update_time"}},
+        )
+
+    @staticmethod
+    def _fill_from_dict(f: dict) -> KalshiFill:
+        side = (f.get("side") or "").lower()
+        price_raw = f.get("yes_price") if side == "yes" else f.get("no_price")
+        price = int(price_raw or 0)
+        return KalshiFill(
+            trade_id=f.get("trade_id", ""),
+            order_id=f.get("order_id", ""),
+            ticker=f.get("ticker", ""),
+            side=side,
+            action=(f.get("action") or "").lower(),
+            count=int(f.get("count") or 0),
+            price_cents=price,
+            is_taker=bool(f.get("is_taker", False)),
+            created_time=f.get("created_time", ""),
+        )
+
+    @staticmethod
+    def _settlement_from_dict(s: dict) -> KalshiSettlement:
+        yes_count = int(s.get("yes_count") or 0)
+        no_count = int(s.get("no_count") or 0)
+        api_revenue = int(s.get("revenue") or 0)
+        cost = int(s.get("yes_total_cost") or 0) + int(s.get("no_total_cost") or 0)
+        # Apply paired-position correction. realized_pnl adds min(yes,no)*100¢
+        # to settlement_revenue — the canonical fix from KalshiTrader 2026-03-02.
+        pnl = realized_pnl(
+            yes_count=yes_count,
+            no_count=no_count,
+            cost_cents=cost,
+            settlement_revenue_cents=api_revenue,
+        )
+        return KalshiSettlement(
+            ticker=s.get("ticker", ""),
+            market_result=(s.get("market_result") or "").lower(),
+            revenue_cents=pnl.revenue_cents,
+            cost_cents=pnl.cost_cents,
+            net_pnl_cents=pnl.net_cents,
+            yes_count=yes_count,
+            no_count=no_count,
+            settled_time=s.get("settled_time", ""),
+        )
 
     def place_limit_order(
         self,

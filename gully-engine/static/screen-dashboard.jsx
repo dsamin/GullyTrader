@@ -134,10 +134,10 @@ const Dashboard = ({ portfolio, positions, liveStrip, bot }) => {
     <>
       <div className="between" style={{ marginBottom: 14 }}>
         <div className="row" style={{ gap: 10 }}>
-          <Avatar initials="AR"/>
+          <Avatar initials="DE"/>
           <div>
             <div style={{ fontSize: 12, color: 'var(--muted)' }}>Welcome back</div>
-            <div className="display" style={{ fontSize: 16 }}>Arjun</div>
+            <div className="display" style={{ fontSize: 16 }}>Devan</div>
           </div>
         </div>
         <div className="row" style={{ gap: 6 }}>
