@@ -193,13 +193,13 @@ const PortfolioRing = ({ roi = 24, win = 68, wagered = 75, size = 130 }) => {
   );
 };
 
-const Scoreboard = ({ teamA = "MUM", teamB = "CHE",
-                      runsA = 142, wicketsA = 4, oversA = "15.2",
-                      runsB = 178, wicketsB = 6, oversB = "20.0",
-                      status = "MUM need 36 in 28",
-                      live = true, glow = true,
-                      venue = "Wankhede · 19:30 IST",
-                      innings = "2nd Innings · T20" }) => {
+const Scoreboard = ({ teamA = "—", teamB = "—",
+                      runsA = 0, wicketsA = 0, oversA = "0.0",
+                      runsB = 0, wicketsB = 0, oversB = "0.0",
+                      status = "",
+                      live = false, glow = false,
+                      venue = "",
+                      innings = "" }) => {
   const tA = TEAMS[teamA] || TEAMS.MUM;
   const tB = TEAMS[teamB] || TEAMS.CHE;
   return (
