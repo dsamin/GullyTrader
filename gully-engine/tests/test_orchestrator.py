@@ -1,0 +1,211 @@
+"""Orchestrator wiring tests — mock all external services and agents.
+
+Verifies the shadow/live gate around place_limit_order in both pipelines
+and that the exit pipeline fetches real mark prices via get_market.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import orchestrator
+from agents.decision import TradeDecision
+from agents.researcher import ResearchNote
+from exit_monitor import ExitDecision
+from kalshi_client import KalshiMarket, KalshiPosition
+
+
+def _set_settings(**overrides):
+    """Override frozen Settings dataclass for the duration of a test."""
+    from settings import settings as _settings
+    originals = {k: getattr(_settings, k) for k in overrides}
+    for k, v in overrides.items():
+        object.__setattr__(_settings, k, v)
+    def restore():
+        for k, v in originals.items():
+            object.__setattr__(_settings, k, v)
+    return restore
+
+
+def _market(ticker: str = "KXIPLGAME-T", yes: int = 50) -> KalshiMarket:
+    return KalshiMarket(
+        ticker=ticker, event_ticker=ticker, title="t",
+        yes_price=yes, no_price=100 - yes, status="open",
+    )
+
+
+def _position(ticker: str = "KXIPLGAME-T", side: str = "yes") -> KalshiPosition:
+    return KalshiPosition(
+        ticker=ticker,
+        yes_count=100 if side == "yes" else 0,
+        no_count=0 if side == "yes" else 100,
+        avg_cost_cents=50,
+        market_exposure_cents=5000,
+    )
+
+
+# ── Entry pipeline ─────────────────────────────────────────────────────
+
+
+def test_entry_shadow_mode_does_not_place_order():
+    restore = _set_settings(decision_mode="shadow")
+    try:
+        client = MagicMock()
+        client.list_ipl_markets.return_value = [_market(yes=40)]
+        client.get_balance.return_value = {"balance": 100_000}
+        client.place_limit_order = MagicMock()
+
+        with patch("orchestrator.KalshiClient", return_value=client), \
+             patch("orchestrator.get_feed") as gf, \
+             patch("orchestrator.scanner_shortlist") as sc, \
+             patch("orchestrator.research") as rs, \
+             patch("orchestrator.decide") as dc:
+            gf.return_value.live_match.return_value = None
+            sc.return_value = [MagicMock(ticker="KXIPLGAME-T", score=80, reason="ok")]
+            rs.return_value = ResearchNote("KXIPLGAME-T", 0.7, 0.6, "yes")
+            dc.return_value = TradeDecision("KXIPLGAME-T", "buy_yes", 5, 41, "edge")
+            result = orchestrator.run_entry_pipeline_once(force=True)
+
+        assert result["status"] == "ok"
+        assert result["decision_mode"] == "shadow"
+        client.place_limit_order.assert_not_called()
+        assert result["candidates"][0]["decision"]["action"] == "buy_yes"
+        assert result["candidates"][0]["order"] is None
+    finally:
+        restore()
+
+
+def test_entry_live_mode_places_order_on_buy():
+    restore = _set_settings(decision_mode="live")
+    try:
+        client = MagicMock()
+        client.list_ipl_markets.return_value = [_market(yes=40)]
+        client.get_balance.return_value = {"balance": 100_000}
+        client.place_limit_order.return_value = {"order_id": "o-1", "status": "queued"}
+
+        with patch("orchestrator.KalshiClient", return_value=client), \
+             patch("orchestrator.get_feed") as gf, \
+             patch("orchestrator.scanner_shortlist") as sc, \
+             patch("orchestrator.research") as rs, \
+             patch("orchestrator.decide") as dc:
+            gf.return_value.live_match.return_value = None
+            sc.return_value = [MagicMock(ticker="KXIPLGAME-T", score=80, reason="ok")]
+            rs.return_value = ResearchNote("KXIPLGAME-T", 0.7, 0.6, "yes")
+            dc.return_value = TradeDecision("KXIPLGAME-T", "buy_yes", 5, 41, "edge")
+            result = orchestrator.run_entry_pipeline_once(force=True)
+
+        client.place_limit_order.assert_called_once_with(
+            ticker="KXIPLGAME-T", side="yes", action="buy",
+            count=5, limit_price_cents=41,
+        )
+        assert result["candidates"][0]["order"] == {"order_id": "o-1", "status": "queued"}
+    finally:
+        restore()
+
+
+def test_entry_live_mode_does_not_place_order_on_pass():
+    restore = _set_settings(decision_mode="live")
+    try:
+        client = MagicMock()
+        client.list_ipl_markets.return_value = [_market(yes=50)]
+        client.get_balance.return_value = {"balance": 100_000}
+        client.place_limit_order = MagicMock()
+
+        with patch("orchestrator.KalshiClient", return_value=client), \
+             patch("orchestrator.get_feed") as gf, \
+             patch("orchestrator.scanner_shortlist") as sc, \
+             patch("orchestrator.research") as rs, \
+             patch("orchestrator.decide") as dc:
+            gf.return_value.live_match.return_value = None
+            sc.return_value = [MagicMock(ticker="KXIPLGAME-T", score=80, reason="ok")]
+            rs.return_value = ResearchNote("KXIPLGAME-T", 0.51, 0.6, "low edge")
+            dc.return_value = TradeDecision("KXIPLGAME-T", "pass", 0, 50, "edge too low")
+            result = orchestrator.run_entry_pipeline_once(force=True)
+
+        client.place_limit_order.assert_not_called()
+        assert result["candidates"][0]["decision"]["action"] == "pass"
+    finally:
+        restore()
+
+
+# ── Exit pipeline ──────────────────────────────────────────────────────
+
+
+def _hold_decision(ticker: str, mark: int) -> ExitDecision:
+    return ExitDecision(ticker=ticker, trigger="llm", action="hold",
+                        mode="shadow", mark_price_cents=mark,
+                        pnl_cents_at_decision=0, note="t")
+
+
+def _sell_decision(ticker: str, mark: int, mode: str) -> ExitDecision:
+    return ExitDecision(ticker=ticker, trigger="llm", action="sell",
+                        mode=mode, mark_price_cents=mark,
+                        pnl_cents_at_decision=100, note="t")
+
+
+def test_exit_shadow_mode_does_not_place_sell_on_sell_decision():
+    restore = _set_settings(exit_mode="shadow")
+    try:
+        client = MagicMock()
+        client.list_positions.return_value = [_position(ticker="KXIPLGAME-T", side="yes")]
+        client.get_market.return_value = _market(ticker="KXIPLGAME-T", yes=70)
+        client.place_limit_order = MagicMock()
+
+        with patch("orchestrator.KalshiClient", return_value=client), \
+             patch("orchestrator.evaluate") as ev:
+            ev.return_value = _sell_decision("KXIPLGAME-T", 70, "shadow")
+            result = orchestrator.run_exit_monitor_once(force=True)
+
+        client.place_limit_order.assert_not_called()
+        assert result["actions"][0]["action"] == "sell"
+        assert result["actions"][0]["order"] is None
+        assert result["exit_mode"] == "shadow"
+    finally:
+        restore()
+
+
+def test_exit_live_mode_places_sell_on_sell_decision():
+    restore = _set_settings(exit_mode="live")
+    try:
+        client = MagicMock()
+        client.list_positions.return_value = [_position(ticker="KXIPLGAME-T", side="yes")]
+        client.get_market.return_value = _market(ticker="KXIPLGAME-T", yes=70)
+        client.place_limit_order.return_value = {"order_id": "sell-1", "status": "queued"}
+
+        with patch("orchestrator.KalshiClient", return_value=client), \
+             patch("orchestrator.evaluate") as ev:
+            ev.return_value = _sell_decision("KXIPLGAME-T", 70, "live")
+            result = orchestrator.run_exit_monitor_once(force=True)
+
+        client.place_limit_order.assert_called_once_with(
+            ticker="KXIPLGAME-T", side="yes", action="sell",
+            count=100, limit_price_cents=69,   # mark - 1
+        )
+        assert result["actions"][0]["order"] == {"order_id": "sell-1", "status": "queued"}
+    finally:
+        restore()
+
+
+def test_exit_pipeline_fetches_real_mark_via_get_market():
+    """The snapshot passed into evaluate() must use yes_price/no_price from
+    get_market, not avg_cost_cents."""
+    restore = _set_settings(exit_mode="shadow")
+    try:
+        client = MagicMock()
+        client.list_positions.return_value = [_position(ticker="KXIPLGAME-T", side="yes")]
+        client.get_market.return_value = _market(ticker="KXIPLGAME-T", yes=73)
+        client.place_limit_order = MagicMock()
+
+        captured = {}
+        def _eval(snap, *, now=None):
+            captured["mark"] = snap.mark_price_cents
+            return _hold_decision(snap.ticker, snap.mark_price_cents)
+
+        with patch("orchestrator.KalshiClient", return_value=client), \
+             patch("orchestrator.evaluate", side_effect=_eval):
+            orchestrator.run_exit_monitor_once(force=True)
+
+        assert captured["mark"] == 73   # yes_price from get_market, not avg_cost_cents (50)
+        client.get_market.assert_called_once_with("KXIPLGAME-T")
+    finally:
+        restore()

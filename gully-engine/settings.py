@@ -82,6 +82,7 @@ class Settings:
     db_path: Path = Path(os.getenv("GULLYTRADER_DB_PATH", "./gullytrader.db"))
     enable_orchestrator: bool = _bool("GULLYTRADER_ENABLE_ORCHESTRATOR", False)
     exit_mode: str = os.getenv("GULLYTRADER_EXIT_MODE", "shadow")
+    decision_mode: str = os.getenv("GULLYTRADER_DECISION_MODE", "shadow")
     sync_interval_seconds: int = _int("GULLYTRADER_SYNC_INTERVAL_SECONDS", 60)
     live_poll_interval_seconds: int = _int("GULLYTRADER_LIVE_POLL_INTERVAL_SECONDS", 5)
     agent_logs_max_age_days: int = _int("GULLYTRADER_AGENT_LOGS_MAX_AGE_DAYS", 7)

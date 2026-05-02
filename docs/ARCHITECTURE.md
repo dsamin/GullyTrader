@@ -85,9 +85,9 @@ Deep reference for how GullyTrader's pieces fit together. For "what's done / wha
 | [`sync_service.py`](../gully-engine/sync_service.py) | Background reconciliation loop. `_reconcile_once()` pulls positions / orders / fills / settlements from Kalshi and upserts them into the matching SQLite tables (`UNIQUE(ticker)` for positions/settlements, `UNIQUE(kalshi_order_id)` for orders, `UNIQUE(kalshi_trade_id)` partial index for fills). Each endpoint is independently try/except'd so one Kalshi 503 can't kill the loop. Loop keep-alive logic from KalshiTrader PR #54. |
 | [`llm.py`](../gully-engine/llm.py) | OpenRouter chat-completions client with JSON mode. Persists every call to `agent_logs` (audit trail). Failures return `None` rather than raising so the caller decides on fallback. |
 | [`agents/scanner.py`](../gully-engine/agents/scanner.py) | Implemented. Prompts qwen-2.5-72b to rank open IPL markets by edge. Drops scores < 30, drops hallucinated tickers, falls back to first-N when LLM is unreachable. |
-| [`agents/researcher.py`](../gully-engine/agents/researcher.py) | Stub. Should consume scanner output, pull live ball-by-ball context, return `ResearchNote{estimated_yes_probability, confidence, reasoning}`. |
-| [`agents/decision.py`](../gully-engine/agents/decision.py) | Stub. Should consume `ResearchNote`, compute Kelly fraction, return a `TradeDecision{action, contracts, limit_price}`. |
-| [`agents/portfolio_exit.py`](../gully-engine/agents/portfolio_exit.py) | Stub. Called by exit_monitor when no hard stop fires. |
+| [`agents/researcher.py`](../gully-engine/agents/researcher.py) | Implemented (Phase 3). Calls `settings.research_model` via OpenRouter to estimate true YES probability for one market. Returns `ResearchNote{estimated_yes_probability, confidence, reasoning}`. Probability clamped to `[0,1]`. Fallback on LLM failure → `confidence=0` (load-bearing: makes Decision skip). |
+| [`agents/decision.py`](../gully-engine/agents/decision.py) | Implemented (Phase 3). Pure-math Quarter-Kelly sizing on `ResearchNote` (no LLM call — the LLM signal lives in the note). Returns `TradeDecision{action, contracts, limit_price_cents, reasoning}`. `pass` if edge<5¢, confidence=0, or contracts<1. Limit price = best-bid + 1¢, clamped `[1, 99]`. Sizing uses limit price (not bid) so the 5%-of-bankroll cap holds at execution. |
+| [`agents/portfolio_exit.py`](../gully-engine/agents/portfolio_exit.py) | Implemented (Phase 3). LLM hold/sell on a single open position. Defaults to HOLD on any failure (LLM unavailable, malformed JSON, invalid action) — never accidentally sells on a bad LLM response. |
 
 ## Key data flows
 
@@ -135,13 +135,18 @@ POST /api/orchestrator/run-entry
        ├─ acquire non-blocking _entry_lock (skip if already running)
        ├─ feed.live_match()                         (cached, ~free)
        ├─ KalshiClient.list_ipl_markets()           (paginates /events; ~5-10s)
+       ├─ KalshiClient.get_balance()                 → bankroll_cents
        ├─ scanner_shortlist(markets, max_results=5) (calls OpenRouter; ~15s)
-       │   ├─ chat_json(agent="scanner", model=qwen-2.5-72b, ...)
-       │   │   └─ POST openrouter.ai/chat/completions
-       │   ├─ writes agent_logs row (audit trail)
-       │   ├─ filters out hallucinated tickers
-       │   └─ filters out score < 30
-       └─ return {markets_scanned, candidates: [...]}
+       └─ for each candidate:
+           ├─ researcher.research(market, live)      → ResearchNote (LLM)
+           │   └─ chat_json(agent="researcher", model=settings.research_model, ...)
+           │       └─ writes agent_logs row (audit trail)
+           ├─ decision.decide(note, bankroll, market) → TradeDecision (pure math)
+           └─ if action != 'pass' and decision_mode == 'live':
+                 KalshiClient.place_limit_order(side, action='buy', count, limit)
+       └─ return {status, markets_scanned, decision_mode, live, candidates: [
+              {ticker, score, scan_reason, research, decision, order}
+          ]}
 ```
 
 ### 3. Manual exit-monitor trigger
@@ -151,13 +156,19 @@ POST /api/orchestrator/run-exit
    └─ orchestrator.run_exit_monitor_once(force=True)
        ├─ KalshiClient.list_positions()
        └─ for each position:
-           ├─ build PositionSnapshot
+           ├─ KalshiClient.get_market(ticker)         → real mark price
+           ├─ build PositionSnapshot (mark = yes_price/no_price for side)
            └─ exit_monitor.evaluate(snap)
                ├─ check stop_loss (% drawdown vs entry)
                ├─ check trailing_stop (% giveback vs peak P&L)
                ├─ check time_stop (open > N minutes)
-               └─ if no hard stop: defer to LLM (currently returns "hold")
-       └─ return [{ticker, action, trigger, mode}, ...]
+               └─ if no hard stop: agents.portfolio_exit.decide(snap, live)
+                   └─ chat_json(agent="portfolio_exit", model=settings.exit_model, ...)
+           └─ if action == 'sell' and exit_mode == 'live':
+                 KalshiClient.place_limit_order(side, action='sell', count, limit=mark-1)
+       └─ return {status, evaluated, exit_mode, actions: [
+              {ticker, action, trigger, mode, note, order}
+          ]}
 ```
 
 The orchestrator's daemon threads run these loops on a `live_poll_interval_seconds` cadence when `GULLYTRADER_ENABLE_ORCHESTRATOR=1`.

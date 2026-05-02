@@ -15,6 +15,8 @@ import logging
 import threading
 import time
 
+from agents.decision import decide
+from agents.researcher import research
 from agents.scanner import shortlist as scanner_shortlist
 from cricket_data import get_feed
 from exit_monitor import PositionSnapshot, evaluate
@@ -51,6 +53,9 @@ def run_entry_pipeline_once(*, force: bool = False) -> dict:
 
         client = KalshiClient()
         markets = client.list_ipl_markets()
+        balance_resp = client.get_balance() or {}
+        balance = int(balance_resp.get("balance", 0) or 0)
+        market_by_ticker = {m.ticker: m for m in markets}
 
         candidates = scanner_shortlist(markets, max_results=5)
         log.info(
@@ -58,15 +63,44 @@ def run_entry_pipeline_once(*, force: bool = False) -> dict:
             len(markets), len(candidates),
             (" [" + ", ".join(f"{c.ticker} ({c.score})" for c in candidates) + "]") if candidates else "",
         )
-        # TODO: researcher / decision agents (next phase)
+
+        results = []
+        for c in candidates:
+            market = market_by_ticker.get(c.ticker)
+            if market is None:
+                continue
+            note = research(market, live)
+            dec = decide(note, bankroll_cents=balance, market=market)
+            order_resp = None
+            if dec.action != "pass" and settings.decision_mode == "live":
+                side = "yes" if dec.action == "buy_yes" else "no"
+                try:
+                    order_resp = client.place_limit_order(
+                        ticker=dec.ticker, side=side, action="buy",
+                        count=dec.contracts, limit_price_cents=dec.limit_price_cents,
+                    )
+                except Exception as e:  # noqa: BLE001 — keep loop alive on order errors
+                    log.exception("orchestrator.entry: place_limit_order failed for %s", dec.ticker)
+                    order_resp = {"error": str(e)}
+            results.append({
+                "ticker": c.ticker, "score": c.score, "scan_reason": c.reason,
+                "research": {
+                    "estimated_yes_probability": note.estimated_yes_probability,
+                    "confidence": note.confidence, "reasoning": note.reasoning,
+                },
+                "decision": {
+                    "action": dec.action, "contracts": dec.contracts,
+                    "limit_price_cents": dec.limit_price_cents, "reasoning": dec.reasoning,
+                },
+                "order": order_resp,
+            })
+
         return {
             "status": "ok",
             "markets_scanned": len(markets),
-            "candidates": [
-                {"ticker": c.ticker, "score": c.score, "reason": c.reason}
-                for c in candidates
-            ],
+            "decision_mode": settings.decision_mode,
             "live": bool(live),
+            "candidates": results,
         }
     finally:
         _entry_lock.release()
@@ -96,20 +130,43 @@ def run_exit_monitor_once(*, force: bool = False) -> dict:
         now = int(time.time())
         for p in positions:
             side = "yes" if p.yes_count >= p.no_count else "no"
-            mark = p.avg_cost_cents  # TODO: use latest market price
+            market = client.get_market(p.ticker)
+            if market is not None:
+                mark = market.yes_price if side == "yes" else market.no_price
+            else:
+                mark = p.avg_cost_cents   # fallback: stale mark; LLM will see zero P&L
             snap = PositionSnapshot(
                 ticker=p.ticker,
                 entry_price_cents=p.avg_cost_cents,
                 mark_price_cents=mark,
-                yes_count=p.yes_count,
-                no_count=p.no_count,
+                yes_count=p.yes_count, no_count=p.no_count,
                 side=side,
-                opened_at=now - 600,   # placeholder; replace with real timestamp
-                peak_pnl_cents=0,
+                opened_at=now - 600,    # TODO(phase-4): track real open time per position
+                peak_pnl_cents=0,       # TODO(phase-4): track peak P&L for trailing-stop
             )
-            decisions.append(evaluate(snap, now=now))
-        return {"status": "ok", "evaluated": len(decisions),
-                "actions": [{"ticker": d.ticker, "action": d.action, "trigger": d.trigger} for d in decisions]}
+            exit_dec = evaluate(snap, now=now)
+            order_resp = None
+            if exit_dec.action == "sell" and settings.exit_mode == "live":
+                try:
+                    order_resp = client.place_limit_order(
+                        ticker=p.ticker, side=side, action="sell",
+                        count=max(p.yes_count, p.no_count),
+                        limit_price_cents=max(1, mark - 1),
+                    )
+                except Exception as e:  # noqa: BLE001 — keep loop alive on order errors
+                    log.exception("orchestrator.exit: place_limit_order failed for %s", p.ticker)
+                    order_resp = {"error": str(e)}
+            decisions.append({
+                "ticker": exit_dec.ticker, "action": exit_dec.action,
+                "trigger": exit_dec.trigger, "mode": exit_dec.mode,
+                "note": exit_dec.note, "order": order_resp,
+            })
+        return {
+            "status": "ok",
+            "evaluated": len(decisions),
+            "exit_mode": settings.exit_mode,
+            "actions": decisions,
+        }
     finally:
         _exit_lock.release()
 
