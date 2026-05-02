@@ -41,6 +41,19 @@ def tmp_db(tmp_path: Path):
         object.__setattr__(_settings, "db_path", original)
 
 
+@pytest.fixture(autouse=True)
+def _stub_live_feed():
+    """Default get_feed() to a no-op stub for hermeticity.
+
+    Any test that needs a live match patches `sync_service.get_feed`
+    explicitly inside its body — that nested patch overrides this fixture.
+    """
+    from unittest.mock import patch
+    with patch("sync_service.get_feed") as gf:
+        gf.return_value.live_match = lambda: None
+        yield gf
+
+
 class _StubClient:
     def __init__(self, *, positions=None, orders=None, fills=None, settlements=None,
                  balance=None):
