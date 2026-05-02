@@ -65,23 +65,37 @@ def _upsert_position(conn: sqlite3.Connection, p: KalshiPosition) -> None:
         # (28 such rows existed pre-Phase-5; cleaned via migration).
         return
     side = normalize_position_side(p.yes_count, p.no_count)
+    # Current unrealized P&L: current market value minus cost basis.
+    # market_exposure_cents is the live mark-to-market value; avg_cost_cents
+    # is per-contract cost. Total cost = avg_cost × max(yes,no) (one of them
+    # is non-zero for a directional position).
+    contracts = max(p.yes_count, p.no_count)
+    cost_basis = p.avg_cost_cents * contracts
+    unrealized = p.market_exposure_cents - cost_basis
+    # Peak only rises. Clamp negative unrealized to 0 — peak represents
+    # high-water mark, never goes below zero.
+    new_peak = max(0, unrealized)
     conn.execute(
         """
         INSERT INTO positions (ticker, side, yes_count, no_count,
                                avg_cost_cents, market_exposure_cents,
+                               unrealized_pnl_cents, peak_pnl_cents,
                                opened_at, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'open')
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
         ON CONFLICT(ticker) DO UPDATE SET
             side=excluded.side,
             yes_count=excluded.yes_count,
             no_count=excluded.no_count,
             avg_cost_cents=excluded.avg_cost_cents,
-            market_exposure_cents=excluded.market_exposure_cents
+            market_exposure_cents=excluded.market_exposure_cents,
+            unrealized_pnl_cents=excluded.unrealized_pnl_cents,
+            peak_pnl_cents=MAX(positions.peak_pnl_cents, excluded.peak_pnl_cents)
         """,
         (
             p.ticker, side if side != "flat" else "yes",
             p.yes_count, p.no_count,
             p.avg_cost_cents, p.market_exposure_cents,
+            unrealized, new_peak,
             int(time.time()),
         ),
     )

@@ -420,3 +420,81 @@ def test_upsert_position_writes_real_positions(tmp_db):
         conn.close()
 
     assert rows[0] == 1, "real position should have been written"
+
+
+def test_upsert_position_tracks_peak_pnl_monotonically(tmp_db):
+    """peak_pnl_cents only ever rises across syncs.
+
+    On first insert: peak = current unrealized P&L (or 0 if negative).
+    On subsequent updates: peak = MAX(stored peak, current).
+    """
+    import sqlite3
+
+    # First sync: yes_count=10, avg_cost=45, exposure=550 → unrealized = 550 - (10*45) = 100
+    p1 = KalshiPosition(
+        ticker="KXIPL-PEAK",
+        yes_count=10, no_count=0,
+        avg_cost_cents=45, market_exposure_cents=550,
+    )
+    conn = sqlite3.connect(str(tmp_db), isolation_level=None)
+    try:
+        sync_service._upsert_position(conn, p1)
+        peak1 = conn.execute(
+            "SELECT peak_pnl_cents FROM positions WHERE ticker = 'KXIPL-PEAK'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert peak1 == 100, f"expected peak 100 after first sync, got {peak1}"
+
+    # Second sync: exposure dropped to 480 → unrealized = 480 - 450 = 30 (lower than peak)
+    p2 = KalshiPosition(
+        ticker="KXIPL-PEAK",
+        yes_count=10, no_count=0,
+        avg_cost_cents=45, market_exposure_cents=480,
+    )
+    conn = sqlite3.connect(str(tmp_db), isolation_level=None)
+    try:
+        sync_service._upsert_position(conn, p2)
+        peak2 = conn.execute(
+            "SELECT peak_pnl_cents FROM positions WHERE ticker = 'KXIPL-PEAK'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert peak2 == 100, f"peak must not decrease, got {peak2}"
+
+    # Third sync: exposure rose to 700 → unrealized = 700 - 450 = 250 (new high)
+    p3 = KalshiPosition(
+        ticker="KXIPL-PEAK",
+        yes_count=10, no_count=0,
+        avg_cost_cents=45, market_exposure_cents=700,
+    )
+    conn = sqlite3.connect(str(tmp_db), isolation_level=None)
+    try:
+        sync_service._upsert_position(conn, p3)
+        peak3 = conn.execute(
+            "SELECT peak_pnl_cents FROM positions WHERE ticker = 'KXIPL-PEAK'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert peak3 == 250, f"expected new peak 250, got {peak3}"
+
+
+def test_upsert_position_negative_unrealized_keeps_peak_at_zero(tmp_db):
+    """If a position is underwater from the start, peak stays at 0."""
+    import sqlite3
+
+    # Underwater: cost 450, exposure 300 → unrealized = -150
+    underwater = KalshiPosition(
+        ticker="KXIPL-DOWN",
+        yes_count=10, no_count=0,
+        avg_cost_cents=45, market_exposure_cents=300,
+    )
+    conn = sqlite3.connect(str(tmp_db), isolation_level=None)
+    try:
+        sync_service._upsert_position(conn, underwater)
+        peak = conn.execute(
+            "SELECT peak_pnl_cents FROM positions WHERE ticker = 'KXIPL-DOWN'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert peak == 0, f"peak should clamp to 0 for negative unrealized, got {peak}"
