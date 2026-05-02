@@ -508,6 +508,14 @@ class KalshiClient:
         limit_price_cents: int,
     ) -> dict:
         if not self._authed:
+            # Real-money write path: never return a stub when the deployed env
+            # is prod, regardless of the strict-mode flag. Catches deploy
+            # misconfigs (KALSHI_API_ENV=prod set but key path forgotten).
+            if settings.kalshi_api_env.lower() == "prod":
+                raise RuntimeError(
+                    "Refusing to place_limit_order: KalshiClient is unauthenticated "
+                    "in prod environment. Real-money path requires real auth."
+                )
             return {"order_id": "stub-order", "ticker": ticker, "status": "queued"}
         body: dict = {
             "ticker": ticker,
@@ -524,6 +532,8 @@ class KalshiClient:
 
     def cancel_order(self, order_id: str) -> dict:
         if not self._authed:
+            # No prod-unauthed guard here (vs place_limit_order): canceling
+            # reduces risk, so a no-op stub in dev/unauthed is safe.
             return {"order_id": order_id, "status": "canceled"}
         return self._request("DELETE", f"/portfolio/orders/{order_id}")
 

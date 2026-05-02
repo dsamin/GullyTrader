@@ -340,3 +340,54 @@ def test_init_does_not_raise_in_non_strict_mode_when_unauthed():
         assert c._authed is False
     finally:
         restore()
+
+
+def test_place_limit_order_in_prod_unauthed_raises():
+    """Real-money path: prod env + no creds must NEVER return stub-order.
+
+    This is independent of strict mode — even if strict is somehow off, prod
+    writes to Kalshi must not silently no-op. Catches deploy misconfigs where
+    KALSHI_API_ENV got set but the key path didn't.
+    """
+    # Force-construct a non-strict client (so __init__ doesn't raise),
+    # then flip env to prod and re-check place_limit_order.
+    restore = _set_settings(
+        strict_external_services=False,
+        kalshi_key_id="",
+        kalshi_private_key_path="",
+        kalshi_api_env="demo",        # let __init__ pass
+    )
+    try:
+        c = KalshiClient()
+        assert c._authed is False
+        # Now flip to prod — place_limit_order must refuse.
+        # Safe to bare-mutate here: _set_settings captured the original
+        # kalshi_api_env above, so restore() will revert this in the finally.
+        from settings import settings as _settings
+        object.__setattr__(_settings, "kalshi_api_env", "prod")
+        with pytest.raises(RuntimeError, match="prod.*unauthenticated|unauthenticated.*prod"):
+            c.place_limit_order(
+                ticker="KXIPLGAME-26MAY07RCBLSG-LSG",
+                side="yes", action="buy", count=10, limit_price_cents=42,
+            )
+    finally:
+        restore()
+
+
+def test_place_limit_order_unauthed_demo_returns_stub():
+    """Demo env preserves the dev-friendly stub-order fallback."""
+    restore = _set_settings(
+        strict_external_services=False,
+        kalshi_key_id="",
+        kalshi_private_key_path="",
+        kalshi_api_env="demo",
+    )
+    try:
+        c = KalshiClient()
+        result = c.place_limit_order(
+            ticker="KXIPL-26-MUMCHE-MUM",
+            side="yes", action="buy", count=10, limit_price_cents=42,
+        )
+        assert result["order_id"] == "stub-order"
+    finally:
+        restore()
