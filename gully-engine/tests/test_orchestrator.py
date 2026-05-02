@@ -293,7 +293,30 @@ def test_run_exit_monitor_writes_exit_to_agent_logs(tmp_db):
     assert "llm" in rows[0]["reasoning"]
 
 
-def test_orchestrator_start_threads_clears_stop_flag():
+@pytest.fixture
+def _stub_orchestrator_loops():
+    """Replace orchestrator's _entry_loop / _exit_loop with no-op waiters.
+
+    The lifecycle tests below care about thread-state semantics (start/stop/
+    is_running), not about what the loops do. Stubbing them prevents real
+    Kalshi/CricAPI calls and DB writes during these tests, and makes the
+    threads exit promptly when _stop_flag is set.
+    """
+    import orchestrator
+    orig_entry = orchestrator._entry_loop
+    orig_exit = orchestrator._exit_loop
+
+    def _waiter():
+        orchestrator._stop_flag.wait()
+
+    orchestrator._entry_loop = _waiter
+    orchestrator._exit_loop = _waiter
+    yield
+    orchestrator._entry_loop = orig_entry
+    orchestrator._exit_loop = orig_exit
+
+
+def test_orchestrator_start_threads_clears_stop_flag(tmp_db, _stub_orchestrator_loops):
     """A start_threads() call after stop() must clear _stop_flag so the new
     threads don't see is_set() and immediately bail."""
     import orchestrator
@@ -306,19 +329,21 @@ def test_orchestrator_start_threads_clears_stop_flag():
         orchestrator.stop()
 
 
-def test_orchestrator_start_threads_is_idempotent():
+def test_orchestrator_start_threads_is_idempotent(tmp_db, _stub_orchestrator_loops):
     """Calling start_threads twice must not spawn two pairs of loops."""
     import orchestrator
     try:
         orchestrator.start_threads()
-        first_running = orchestrator.is_running()
-        orchestrator.start_threads()    # second call is a no-op
-        assert orchestrator.is_running() == first_running == True
+        threads_after_first = list(orchestrator._threads)
+        result = orchestrator.start_threads()    # second call is a no-op
+        assert result is None
+        assert orchestrator._threads == threads_after_first   # same Thread objects
+        assert orchestrator.is_running() is True
     finally:
         orchestrator.stop()
 
 
-def test_orchestrator_is_running_reflects_state():
+def test_orchestrator_is_running_reflects_state(tmp_db, _stub_orchestrator_loops):
     import orchestrator
     orchestrator.stop()
     assert orchestrator.is_running() is False
