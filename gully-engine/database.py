@@ -16,21 +16,6 @@ from settings import settings
 
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS markets (
-    ticker TEXT PRIMARY KEY,
-    event_ticker TEXT NOT NULL,
-    title TEXT,
-    yes_price INTEGER,
-    no_price INTEGER,
-    status TEXT,
-    close_time INTEGER,
-    last_seen_at INTEGER,
-    metadata_json TEXT
-);
-
-CREATE INDEX IF NOT EXISTS markets_event_idx ON markets(event_ticker);
-CREATE INDEX IF NOT EXISTS markets_status_idx ON markets(status);
-
 CREATE TABLE IF NOT EXISTS positions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker TEXT NOT NULL,
@@ -109,18 +94,6 @@ CREATE TABLE IF NOT EXISTS agent_logs (
 
 CREATE INDEX IF NOT EXISTS agent_logs_created_idx ON agent_logs(created_at);
 
-CREATE TABLE IF NOT EXISTS exit_decisions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ticker TEXT NOT NULL,
-    trigger TEXT NOT NULL,             -- stop_loss | trailing_stop | time | llm | manual
-    action TEXT NOT NULL,              -- hold | sell
-    mode TEXT NOT NULL,                -- shadow | live
-    mark_price_cents INTEGER,
-    pnl_cents_at_decision INTEGER,
-    note TEXT,
-    created_at INTEGER NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS cricket_matches (
     match_id TEXT PRIMARY KEY,
     series TEXT,
@@ -197,6 +170,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("DROP TABLE IF EXISTS closed_market_cache")
     except sqlite3.OperationalError:
         pass
+
+    # Phase 5: drop dead schema tables (markets, exit_decisions).
+    # Both were scaffolded but never written to or read from outside CREATE.
+    for dead_table in ("markets", "exit_decisions"):
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS {dead_table}")
+        except sqlite3.OperationalError:
+            pass
 
 
 @contextlib.contextmanager
