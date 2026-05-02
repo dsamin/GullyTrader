@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging as _logging
 from unittest.mock import MagicMock
 
 import pytest
@@ -283,3 +284,73 @@ def test_standings_falls_back_to_series_info_pointstable():
     rows = feed.standings()
     assert len(rows) == 1
     assert rows[0].points == 18
+
+
+# ── Strict-mode get_feed() ─────────────────────────────────────────────
+
+
+def _set_cricket_settings(**overrides):
+    """Same Settings-override helper as test_kalshi_client uses."""
+    from settings import settings as _settings
+    originals = {k: getattr(_settings, k) for k in overrides}
+    for k, v in overrides.items():
+        object.__setattr__(_settings, k, v)
+
+    def _restore():
+        for k, v in originals.items():
+            object.__setattr__(_settings, k, v)
+    return _restore
+
+
+def test_get_feed_strict_cricapi_no_key_raises():
+    """Strict mode + provider=cricapi + missing key → loud failure."""
+    from cricket_data import get_feed
+    restore = _set_cricket_settings(
+        strict_external_services=True,
+        cricket_feed_provider="cricapi",
+        cricket_feed_api_key="",
+    )
+    try:
+        with pytest.raises(RuntimeError, match="CRICKET_FEED_API_KEY"):
+            get_feed()
+    finally:
+        restore()
+
+
+def test_get_feed_strict_stub_logs_warning(caplog):
+    """Strict mode + provider=stub → still works, but logs WARNING (so prod
+    operators see we're running on stub data and not real cricket state)."""
+    from cricket_data import get_feed, StubCricketFeed
+    restore = _set_cricket_settings(
+        strict_external_services=True,
+        cricket_feed_provider="stub",
+    )
+    try:
+        with caplog.at_level(_logging.WARNING, logger="cricket_data"):
+            feed = get_feed()
+        assert isinstance(feed, StubCricketFeed)
+        # Must have logged a WARNING-level record mentioning stub.
+        warns = [r for r in caplog.records if r.levelno >= _logging.WARNING]
+        assert any("stub" in r.getMessage().lower() for r in warns), \
+            f"expected a stub-related WARNING, got: {[r.getMessage() for r in warns]}"
+    finally:
+        restore()
+
+
+def test_get_feed_non_strict_cricapi_no_key_falls_back_to_stub(caplog):
+    """Existing behavior preserved in non-strict mode: missing key → stub +
+    a warning. Catches the dev posture where you forgot to set the key."""
+    from cricket_data import get_feed, StubCricketFeed
+    restore = _set_cricket_settings(
+        strict_external_services=False,
+        cricket_feed_provider="cricapi",
+        cricket_feed_api_key="",
+    )
+    try:
+        with caplog.at_level(_logging.WARNING, logger="cricket_data"):
+            feed = get_feed()
+        assert isinstance(feed, StubCricketFeed)
+        warns = [r for r in caplog.records if r.levelno >= _logging.WARNING]
+        assert any("falling back to stub" in r.getMessage().lower() for r in warns)
+    finally:
+        restore()

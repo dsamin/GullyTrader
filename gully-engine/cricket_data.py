@@ -423,14 +423,34 @@ class CricApiFeed:
 
 
 def get_feed() -> CricketFeed:
-    """Factory — picks an implementation based on CRICKET_FEED_PROVIDER."""
-    provider = settings.cricket_feed_provider.lower()
+    """Factory — picks an implementation based on CRICKET_FEED_PROVIDER.
+
+    Strict-mode behavior (settings.strict_external_services=True):
+        - provider=stub → returns StubCricketFeed but logs WARNING (real
+          deploys must surface that they're running on stub data).
+        - provider=cricapi but key missing → raises RuntimeError instead of
+          silently falling back. Real-money decisions never read stub state.
+
+    Non-strict (default in dev):
+        - provider=stub → returns StubCricketFeed, no warning (expected).
+        - provider=cricapi but key missing → logs warning, returns StubCricketFeed.
+    """
+    provider = settings.cricket_feed_provider.strip().lower()
     if provider == "stub":
+        if settings.strict_external_services:
+            log.warning(
+                "CRICKET_FEED_PROVIDER=stub in strict mode — "
+                "dashboard/agents will read mock cricket data, not live state"
+            )
         return StubCricketFeed()
     if provider == "cricapi":
-        if not settings.cricket_feed_api_key:
+        if not settings.cricket_feed_api_key.strip():
+            if settings.strict_external_services:
+                raise RuntimeError(
+                    "CRICKET_FEED_PROVIDER=cricapi but CRICKET_FEED_API_KEY is empty — "
+                    "refusing to start in strict mode"
+                )
             log.warning("CRICKET_FEED_PROVIDER=cricapi but CRICKET_FEED_API_KEY is empty — falling back to stub")
             return StubCricketFeed()
         return CricApiFeed(api_key=settings.cricket_feed_api_key)
-    # TODO: SportMonks, etc.
     raise NotImplementedError(f"Cricket feed provider '{provider}' not implemented")
